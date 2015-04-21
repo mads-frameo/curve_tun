@@ -3,7 +3,7 @@
 
 -export([connect/3, accept/1, accept/2, listen/2, send/2, close/1,
          recv/1, recv/2, controlling_process/2,
-         metadata/1
+         metadata/1, async_recv/1
         ]).
 
 %% Private callbacks
@@ -49,7 +49,12 @@ recv(State) ->
     recv(State, 5000).
 
 close(#curve_tun_socket { pid = Pid }) ->
-    gen_fsm:sync_send_event(Pid, close).
+    try
+        gen_fsm:sync_send_event(Pid, close)
+    catch
+        %% already closed
+        exit:{noproc,{gen_fsm,sync_send_event,[Pid,close]}} -> ok
+    end.
 
 listen(Port, Opts) ->
     {SocketOpts, #{ metadata := MD }} = filter_options(Opts),
@@ -76,6 +81,16 @@ controlling_process(#curve_tun_socket { pid = Pid }, Controller) ->
 
 metadata(#curve_tun_socket{ pid=Pid}) ->
     gen_fsm:sync_send_event(Pid, metadata).
+
+async_recv(#curve_tun_socket{ pid=Pid }) ->
+    case erlang:is_process_alive(Pid) of
+        true ->
+            gen_fsm:send_event(Pid, async_recv),
+            ok;
+        false ->
+            {error, closed}
+    end.
+
 
 %% @private
 start_fsm() ->
@@ -138,9 +153,9 @@ ready({connect, Address, Port, Options}, From, State) ->
                     {stop, normal, {error, Reason}, State}
             end
     end.
-    
-ready(_Msg, ready) ->
-    {stop, argh, ready}.
+
+ready(_Msg, State) ->
+    {stop, argh, State}.
 
 initiating(_Msg, _From, _State) ->
     {stop, argh, ready}.
@@ -162,15 +177,17 @@ closed(close, _From, State) ->
 closed({send, _}, _From, State) ->
     {reply, {error, closed}, State}.
 
-connected(_M, _) ->
-    {stop, argh, connected}.
+connected(async_recv, #{ recv_queue := Q } = State) ->
+    process_recv_queue(State#{ recv_queue := queue:in(async_recv, Q) });
+connected(_M, State) ->
+    {stop, argh, State}.
 
 connected(close, _From, #{ socket := Sock } = State) ->
     ok = gen_tcp:close(Sock),
     {stop, normal, ok, maps:remove(socket, State)};
-connected(recv, From, #{ socket := Sock, recv_queue := Q } = State) ->
-    ok = inet:setopts(Sock, [{active, once}]),
-    {next_state, connected, State#{ recv_queue := queue:in(From, Q) }};
+connected(recv, From, #{ recv_queue := Q } = State) ->
+    process_recv_queue(State#{ recv_queue := queue:in({sync, From}, Q) });
+
 connected({send, M}, _From, #{ socket := Socket, secret_key := Ks, peer_public_key := P, c := NonceCount, side := Side } = State) ->
     case gen_tcp:send(Socket, e_msg(M, Side, NonceCount, P, Ks)) of
          ok -> {reply, ok, connected, State#{ c := NonceCount + 1}};
@@ -205,13 +222,28 @@ handle_info(Info, Statename, State) ->
     error_logger:info_msg("Unknown info msg ~p in state ~p", [Info, Statename]),
     {next_state, Statename, State}.
 
-terminate(_Reason, _Statename, _State) ->
+terminate(_Reason, _Statename, State) ->
+    send_close_events(State),
     ok.
 
 code_change(_OldVsn, Statename, State, _Aux) ->
     {ok, Statename, State}.
 
 %% INTERNAL HANDLERS
+
+send_close_events(#{ recv_queue := Q, controller := Controller }) ->
+
+    %% reply {error, closed} to all sync callers
+    [ gen_fsm:reply(Receiver, {error, closed}) || {sync, Receiver} <- queue:to_list(Q) ],
+
+    %% if there is at least one async receive pending, notify controller (once)
+    case queue:member(async_recv, Q) of
+        true ->
+            send(Controller, {curve_tun_closed, self()});
+        false ->
+            ok
+    end,
+    ok.
 
 unpack_cookie(<<Nonce:16/binary, Cookie/binary>>) ->
     CNonce = lt_nonce(minute_k, Nonce),
@@ -234,13 +266,16 @@ reply(M, #{ from := From } = State) ->
 %% Analyze the current waiting receivers and the buffer state. If there is a receiver for the buffered
 %% message, then send the message back the receiver.
 %% @end
-process_recv_queue(#{ recv_queue := Q, buf := Buf, socket := Sock } = State) ->
+process_recv_queue(#{ recv_queue := Q, buf := Buf, socket := Sock, controller := Controller } = State) ->
     case {queue:out(Q), Buf} of
         {{{value, _Receiver}, _Q2}, undefined} ->
             ok = inet:setopts(Sock, [{active, once}]),
             {next_state, connected, State};
-        {{{value, Receiver}, Q2}, Msg} ->
-            gen_fsm:reply(Receiver, Msg),
+        {{{value, {sync, Receiver}}, Q2}, Msg} ->
+            gen_fsm:reply(Receiver, {ok, Msg}),
+            process_recv_queue(State#{ recv_queue := Q2, buf := undefined });
+        {{{value, async_recv}, Q2}, Msg} ->
+            erlang:send(Controller, {curve_tun, self(), Msg}),
             process_recv_queue(State#{ recv_queue := Q2, buf := undefined });
         {{empty, _Q2}, _} ->
             {next_state, connected, State}
