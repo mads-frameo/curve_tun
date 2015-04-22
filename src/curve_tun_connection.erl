@@ -3,7 +3,7 @@
 
 -export([connect/3, accept/1, accept/2, listen/2, send/2, close/1,
          recv/1, recv/2, controlling_process/2,
-         metadata/1, async_recv/1
+         metadata/1, async_recv/2
         ]).
 
 %% Private callbacks
@@ -13,10 +13,10 @@
 -export([init/1, code_change/4, terminate/3, handle_info/3, handle_event/3, handle_sync_event/4]).
 
 -export([
-	closed/2, closed/3,
+        accepting/2, connecting/2,
 	connected/2, connected/3,
-	initiating/2, initiating/3,
-        vouched/2, vouched/3,
+	awaiting_cookie/2, awaiting_cookie/3,
+        awaiting_ready/2, awaiting_ready/3,
 	ready/2, ready/3
 ]).
 
@@ -31,8 +31,11 @@
 -define(COUNT_LIMIT, 18446744073709551616 - 1).
 
 connect(Address, Port, Options) ->
+    connect(Address, Port, Options, infinity).
+
+connect(Address, Port, Options, Timeout) ->
     {ok, Pid} = start_fsm(),
-    case gen_fsm:sync_send_event(Pid, {connect, Address, Port, Options}) of
+    case sync_send_event(Pid, {connect, Address, Port, Options, Timeout}) of
         ok ->
             {ok, #curve_tun_socket { pid = Pid }};
         {error, Reason} ->
@@ -40,20 +43,20 @@ connect(Address, Port, Options) ->
     end.
 
 send(#curve_tun_socket { pid = Pid }, Msg) ->
-    gen_fsm:sync_send_event(Pid, {send, Msg}).
+    sync_send_event(Pid, {send, Msg}).
 
 recv(#curve_tun_socket { pid = Pid }, Timeout) ->
-    gen_fsm:sync_send_event(Pid, recv, Timeout).
+    sync_send_event(Pid, {recv, Timeout}).
 
 recv(State) ->
-    recv(State, 5000).
+    recv(State, infinity).
 
 close(#curve_tun_socket { pid = Pid }) ->
-    try
-        gen_fsm:sync_send_event(Pid, close)
-    catch
-        %% already closed
-        exit:{noproc,{gen_fsm,sync_send_event,[Pid,close]}} -> ok
+    case sync_send_all_state_event(Pid, close) of
+        {error, closed} ->
+            ok;
+        Other ->
+            Other
     end.
 
 listen(Port, Opts) ->
@@ -66,7 +69,7 @@ listen(Port, Opts) ->
 
 accept(#curve_tun_lsock { lsock = LSock, metadata = MD }, Timeout) ->
     {ok, Pid} = start_fsm(),
-    case gen_fsm:sync_send_event(Pid, {accept, LSock, MD}, Timeout) of
+    case sync_send_event(Pid, {accept, LSock, MD, Timeout}) of
        ok ->
            {ok, #curve_tun_socket { pid = Pid }};
        {error, Reason} ->
@@ -74,22 +77,16 @@ accept(#curve_tun_lsock { lsock = LSock, metadata = MD }, Timeout) ->
    end.
 
 accept(State) ->
-   accept(State, 5000).
+   accept(State, infinity).
 
 controlling_process(#curve_tun_socket { pid = Pid }, Controller) ->
-    gen_fsm:sync_send_all_state_event(Pid, {controlling_process, Controller}).
+    sync_send_all_state_event(Pid, {controlling_process, Controller}).
 
 metadata(#curve_tun_socket{ pid=Pid}) ->
-    gen_fsm:sync_send_event(Pid, metadata).
+    sync_send_event(Pid, metadata).
 
-async_recv(#curve_tun_socket{ pid=Pid }) ->
-    case erlang:is_process_alive(Pid) of
-        true ->
-            gen_fsm:send_event(Pid, async_recv),
-            ok;
-        false ->
-            {error, closed}
-    end.
+async_recv(#curve_tun_socket{ pid=Pid }, Timeout) ->
+    sync_send_event(Pid, {async_recv, Timeout}).
 
 
 %% @private
@@ -113,80 +110,66 @@ init([Controller]) ->
 
 
 %% @private
-ready({accept, LSock, MetaData}, From, #{ vault := Vault} = State) ->
-    case gen_tcp:accept(LSock) of
-        {error, Reason} ->
-            {stop, normal, {error, Reason}, ready, State};
-        {ok, Socket} ->
-            InitState = State#{ socket => Socket, md => MetaData },
-            ok = inet:setopts(Socket, [{active, once}]),
-            {ok, EC} = recv_hello(InitState),
-            %% Once ES is in the hands of the client, the server doesn't need it anymore
-            #{ public := ES, secret := ESs } = enacl:box_keypair(),
-            case  gen_tcp:send(Socket, e_cookie(EC, ES, ESs, Vault)) of
-                ok ->
-                    ok = inet:setopts(Socket, [{active, once}]),
-                    {next_state, accepting, InitState#{ from => From }};
-                {error, Reason} ->
-                    {stop, normal, {error, Reason}, State}
-           end
-    end;
-ready({connect, Address, Port, Options}, From, State) ->
+ready({accept, LSock, MetaData, Timeout}, From, State) ->
+    Timer = start_timer(Timeout, connect_or_accept),
+    ok = curve_tun_socket_helper:async_accept(LSock),
+    {next_state, accepting, State#{ from => From, md => MetaData, timer => Timer}};
+ready({connect, Address, Port, Options, Timeout}, From, State) ->
+    Timer = start_timer(Timeout, connect_or_accept),
     {SocketOpts, #{ key := S, metadata := MD }} = filter_options(Options),
     TcpOpts = [{packet, 2}, binary, {active, false} | SocketOpts],
-    case gen_tcp:connect(Address, Port, TcpOpts) of
-        {error, Reason} ->
-            {stop, normal, {error, Reason}, State};
-        {ok, Socket} ->
-            #{ public := EC, secret := ECs } = enacl:box_keypair(),
-            case gen_tcp:send(Socket, e_hello(S, EC, ECs, 0)) of
-                ok ->
-                    ok = inet:setopts(Socket, [{active, once}]),
-                    {next_state, initiating, State#{
-                    	from => From,
-                    	peer_lt_public_key => S,
-                    	public_key => EC,
-                    	secret_key => ECs,
-                    	socket => Socket,
-                        md => MD }};
-                {error, Reason} ->
-                    {stop, normal, {error, Reason}, State}
-            end
-    end.
+    ok = curve_tun_socket_helper:async_connect(Address, Port, TcpOpts),
+    {next_state, connecting, State#{ peer_lt_public_key => S, md => MD, from => From, timer => Timer }}.
 
 ready(_Msg, State) ->
     {stop, argh, State}.
 
-initiating(_Msg, _From, _State) ->
+connecting({connect, {ok, Socket}}, #{ peer_lt_public_key := S } = State) ->
+    #{ public := EC, secret := ECs } = enacl:box_keypair(),
+    case gen_tcp:send(Socket, e_hello(S, EC, ECs, 0)) of
+        ok ->
+            ok = inet:setopts(Socket, [{active, once}]),
+            {next_state, awaiting_cookie, State#{
+                                       public_key => EC,
+                                       secret_key => ECs,
+                                       socket => Socket }};
+        {error, Reason} ->
+            {stop, normal, reply({error, Reason}, State)}
+    end;
+connecting({connect, {error, Reason}}, State) ->
+    {stop, normal, reply({error, Reason}, State)}.
+
+
+accepting({accept, {ok, Socket}}, State) ->
+    InitState = State#{ socket => Socket },
+    ok = inet:setopts(Socket, [{active, once}]),
+    {next_state, awaiting_hello, InitState};
+accepting({accept, {error, Reason}}, State) ->
+    {stop, normal, reply({error, Reason}, State)}.
+
+awaiting_cookie(_Msg, _From, State) ->
+    {stop, {unexpected_message, _Msg}, State}.
+
+awaiting_cookie(_Msg, _) ->
     {stop, argh, ready}.
 
-initiating(_Msg, _) ->
+awaiting_ready(_Msg, _From, _State) ->
     {stop, argh, ready}.
 
-vouched(_Msg, _From, _State) ->
+awaiting_ready(_Msg, _) ->
     {stop, argh, ready}.
 
-vouched(_Msg, _) ->
-    {stop, argh, ready}.
-
-closed(_Msg, _State) ->
-    {stop, argh, closed}.
-
-closed(close, _From, State) ->
-    {stop, normal, ok, State};
-closed({send, _}, _From, State) ->
-    {reply, {error, closed}, State}.
-
-connected(async_recv, #{ recv_queue := Q } = State) ->
-    process_recv_queue(State#{ recv_queue := queue:in(async_recv, Q) });
 connected(_M, State) ->
     {stop, argh, State}.
 
-connected(close, _From, #{ socket := Sock } = State) ->
-    ok = gen_tcp:close(Sock),
-    {stop, normal, ok, maps:remove(socket, State)};
-connected(recv, From, #{ recv_queue := Q } = State) ->
-    process_recv_queue(State#{ recv_queue := queue:in({sync, From}, Q) });
+connected({recv, Timeout}, From, #{ recv_queue := Q } = State) ->
+    Timer = start_timer(Timeout, {sync_recv, From}),
+    process_recv_queue(State#{ recv_queue := queue:in(#{ type=>sync_recv, from => From, timer => Timer}, Q) });
+connected({async_recv, Timeout}, From, #{ recv_queue := Q } = State) ->
+    Ref = make_ref(),
+    Timer = start_timer(Timeout, {async_recv, Ref}),
+    gen_fsm:reply(From, {ok, Ref}),
+    process_recv_queue(State#{ recv_queue := queue:in(#{ type=>async_recv, ref => Ref, timer => Timer}, Q) });
 
 connected({send, M}, _From, #{ socket := Socket, secret_key := Ks, peer_public_key := P, c := NonceCount, side := Side } = State) ->
     case gen_tcp:send(Socket, e_msg(M, Side, NonceCount, P, Ks)) of
@@ -203,6 +186,9 @@ handle_sync_event({controlling_process, Controller}, {PrevController, _Tag}, Sta
     {reply, ok, Statename, State#{ controller := {Controller, NewRef}}};
 handle_sync_event({controlling_process, _Controller}, _From, Statename, State) ->
     {reply, {error, not_owner}, Statename, State};
+handle_sync_event(close, _From, _StateName, #{ socket:=Socket } = State) ->
+    gen_tcp:close(Socket),
+    {stop, normal, ok, maps:remove(socket, State) };
 handle_sync_event(Event, _From, Statename, State) ->
     error_logger:info_msg("Unknown sync_event ~p in state ~p", [Event, Statename]),
     {next_state, Statename, State}.
@@ -213,17 +199,43 @@ handle_event(Event, Statename, State) ->
 
 handle_info({'DOWN', _Ref, process, Pid, _Info}, _Statename, #{ controller := Pid, socket := Socket } = State) ->
     ok = gen_tcp:close(Socket),
-    {stop, tcp_closed, maps:remove(socket, State)};
+    {stop, normal, maps:remove(socket, State)};
 handle_info({tcp, Sock, Data}, Statename, #{ socket := Sock } = State) ->
     handle_tcp(Data, Statename, State);
-handle_info({tcp_closed, Sock}, Statename, #{ socket := Sock } = State) ->
-    handle_tcp_closed(Statename, State);
+handle_info({tcp_closed, Sock}, _Statename, #{ socket := Sock } = State) ->
+    {stop, {shutdown, transport_closed}, maps:remove(socket, handle_unrecv_data(State))};
+handle_info({tcp_error, Sock, Reason}, _Statename, #{ socket := Sock } = State) ->
+    {stop, {shutdown, {transport_error, Reason}}, maps:remove(socket, handle_unrecv_data(State))};
+handle_info({timer, connect_or_accept}, _Statename, State) ->
+    {stop, normal, reply({error, timeout}, State)};
+handle_info({timer, {sync_recv, From}}, Statename, #{ recv_queue := Q } = State) ->
+    gen_fsm:reply(From, {error, timeout}),
+    NewQ = queue:from_list(lists:foldr(fun(#{ from := F }, Acc) when F =:= From -> Acc;
+                                          (E, Acc) -> [E|Acc] end,
+                                       [],
+                                       queue:to_list(Q))),
+    {next_state, Statename, State#{ recv_queue => NewQ }};
+handle_info({timer, {async_recv, Ref}}, Statename, #{ recv_queue := Q, controller := {Controller,_} } = State) ->
+    erlang:send(Controller, {curve_tun_async_timeout, {curve_tun_socket, self()}, Ref}),
+    NewQ = queue:from_list(lists:foldr(fun(#{ ref := R }, Acc) when R =:= Ref -> Acc;
+                                          (E, Acc) -> [E|Acc] end,
+                                       [],
+                                       queue:to_list(Q))),
+    {next_state, Statename, State#{ recv_queue => NewQ }};
+
 handle_info(Info, Statename, State) ->
     error_logger:info_msg("Unknown info msg ~p in state ~p", [Info, Statename]),
     {next_state, Statename, State}.
 
+
 terminate(_Reason, _Statename, State) ->
-    send_close_events(State),
+
+    case maps:find(socket, State) of
+        {ok, Sock} -> gen_tcp:close(Sock);
+        error -> ok
+    end,
+
+    handle_unrecv_data(State),
     ok.
 
 code_change(_OldVsn, Statename, State, _Aux) ->
@@ -231,19 +243,22 @@ code_change(_OldVsn, Statename, State, _Aux) ->
 
 %% INTERNAL HANDLERS
 
-send_close_events(#{ recv_queue := Q, controller := Controller }) ->
+handle_unrecv_data(#{ recv_queue := Q, controller := {Controller,_} } = State) ->
 
     %% reply {error, closed} to all sync callers
-    [ gen_fsm:reply(Receiver, {error, closed}) || {sync, Receiver} <- queue:to_list(Q) ],
+    [ gen_fsm:reply(Receiver, {error, closed}) || #{ type := sync_recv, from := Receiver } <- queue:to_list(Q) ],
+
 
     %% if there is at least one async receive pending, notify controller (once)
-    case queue:member(async_recv, Q) of
-        true ->
-            send(Controller, {curve_tun_closed, self()});
-        false ->
-            ok
+    case [ ok || #{ type := async_recv } <- queue:to_list(Q) ] of
+        [] ->
+            ok;
+        _ ->
+            erlang:send(Controller, {curve_tun_closed, {curve_tun_socket,self()}})
     end,
-    ok.
+    State#{ recv_queue=>queue:new() };
+handle_unrecv_data(State) ->
+    State.
 
 unpack_cookie(<<Nonce:16/binary, Cookie/binary>>) ->
     CNonce = lt_nonce(minute_k, Nonce),
@@ -259,23 +274,33 @@ unpack_cookie_([K | Ks], CNonce, Cookie) ->
     end.
 
 reply(M, #{ from := From } = State) ->
+    State2 = case maps:find(timer, State) of
+                 {ok, Timer} ->
+                     cancel_timer(Timer),
+                     maps:remove(timer, State);
+                 error ->
+                     State
+             end,
     gen_fsm:reply(From, M),
-    maps:remove(from, State).
+    maps:remove(from, State2).
     
 %% @doc process_recv_queue/1 sends messages back to waiting receivers
 %% Analyze the current waiting receivers and the buffer state. If there is a receiver for the buffered
 %% message, then send the message back the receiver.
 %% @end
-process_recv_queue(#{ recv_queue := Q, buf := Buf, socket := Sock, controller := Controller } = State) ->
+process_recv_queue(#{ recv_queue := Q, buf := Buf, socket := Sock, controller := {Controller,_} } = State) ->
     case {queue:out(Q), Buf} of
         {{{value, _Receiver}, _Q2}, undefined} ->
             ok = inet:setopts(Sock, [{active, once}]),
             {next_state, connected, State};
-        {{{value, {sync, Receiver}}, Q2}, Msg} ->
+        {{{value, #{ type := sync_recv, from := Receiver, timer := Timer }}, Q2}, Msg} ->
+            cancel_timer(Timer),
             gen_fsm:reply(Receiver, {ok, Msg}),
             process_recv_queue(State#{ recv_queue := Q2, buf := undefined });
-        {{{value, async_recv}, Q2}, Msg} ->
-            erlang:send(Controller, {curve_tun, self(), Msg}),
+        {{{value, #{ type := async_recv, ref := _Ref, timer := Timer }}, Q2}, Msg} ->
+            cancel_timer(Timer),
+            AM = {curve_tun, {curve_tun_socket,self()}, Msg},
+            erlang:send(Controller, AM),
             process_recv_queue(State#{ recv_queue := Q2, buf := undefined });
         {{empty, _Q2}, _} ->
             {next_state, connected, State}
@@ -326,7 +351,7 @@ handle_cookie(N, Box, #{ public_key := EC, secret_key := ECs, peer_lt_public_key
     case gen_tcp:send(Socket, e_vouch(K, EC, S, Vault, 1, ES, ECs, MD)) of
         ok ->
             ok = inet:setopts(Socket, [{active, once}]),
-            {next_state, vouched, State#{
+            {next_state, awaiting_ready, State#{
 			peer_public_key => ES,
 			recv_queue => queue:new(),
 			buf => undefined,
@@ -350,17 +375,31 @@ handle_ready(N, Box, State = #{
     ok = inet:setopts(Sock, [{active, once}]),
     {next_state, connected, reply(ok, State#{ rc := N+1, rmd => ServersMD })}.
 
+handle_hello(EC, Box, #{ vault := Vault, socket := Socket } = State) ->
+
+    STNonce = st_nonce(hello, client, 0),
+    {ok, <<0:512/integer>>} = Vault:box_open(Box, STNonce, EC),
+
+    %% Once ES is in the hands of the client, the server doesn't need it anymore
+    #{ public := ES, secret := ESs } = enacl:box_keypair(),
+    case  gen_tcp:send(Socket, e_cookie(EC, ES, ESs, Vault)) of
+        ok ->
+            ok = inet:setopts(Socket, [{active, once}]),
+            {next_state, awaiting_vouch, State};
+        {error, Reason} ->
+            {stop, normal, {error, Reason}, State}
+    end.
+
 
 handle_tcp(Data, StateName, State) ->
     case {d_packet(Data), StateName} of
         {{msg, N, Box}, connected} -> handle_msg(N, Box, State);
-        {{vouch, K, N, Box}, accepting} -> handle_vouch(K, N, Box, State);
-        {{cookie, N, Box}, initiating} -> handle_cookie(N, Box, State);
-        {{ready, N, Box}, vouched} -> handle_ready(N, Box, State)
+        {{vouch, K, N, Box}, awaiting_vouch} -> handle_vouch(K, N, Box, State);
+        {{cookie, N, Box}, awaiting_cookie} -> handle_cookie(N, Box, State);
+        {{ready, N, Box}, awaiting_ready} -> handle_ready(N, Box, State);
+        {{hello, EC, 0, Box}, awaiting_hello} -> handle_hello(EC, Box, State)
     end.
 
-handle_tcp_closed(_Statename, State) ->
-    {next_state, closed, maps:remove(socket, State)}.
 
 %% NONCE generation
 %%
@@ -377,23 +416,6 @@ st_nonce(ready, server, N) -> <<"CurveCP-server-R", N:64/integer>>.
 lt_nonce(minute_k, N) -> <<"minute-k", N/binary>>;
 lt_nonce(client, N) -> <<"CurveCPV", N/binary>>;
 lt_nonce(server, N) -> <<"CurveCPK", N/binary>>.
-
-%% RECEIVING expected messages
-recv_hello(#{ socket := Socket, vault := Vault}) ->
-    receive
-        {tcp, Socket, Data} ->
-            case d_packet(Data) of
-                {hello, EC, 0, Box} ->
-                    STNonce = st_nonce(hello, client, 0),
-                    {ok, <<0:512/integer>>} = Vault:box_open(Box, STNonce, EC),
-                    {ok, EC};
-                Otherwise ->
-                    error_logger:info_report([received, Otherwise]),
-                    {error, ehello}
-            end
-   after 5000 ->
-       {error, timeout}
-   end.
 
    
 %% COMMAND GENERATION
@@ -499,3 +521,42 @@ filter_options([KV={K,V}|Rest], SocketOpts, CurveOpts) ->
         false ->
             filter_options(Rest, [KV|SocketOpts], CurveOpts)
     end.
+
+%% UTILITY
+
+sync_send_all_state_event(FsmPid, Event) ->
+    try gen_fsm:sync_send_all_state_event(FsmPid, Event, infinity)
+    catch
+ 	exit:{noproc, _} ->
+ 	    {error, closed};
+	exit:{normal, _} ->
+	    {error, closed};
+	exit:{{shutdown, _},_} ->
+	    {error, closed}
+    end.
+
+sync_send_event(FsmPid, Event) ->
+    sync_send_event(FsmPid, Event, infinity).
+
+sync_send_event(FsmPid, Event, Timeout) ->
+    try gen_fsm:sync_send_event(FsmPid, Event, Timeout)
+    catch
+ 	exit:{noproc, _} ->
+ 	    {error, closed};
+	exit:{normal, _} ->
+	    {error, closed};
+	exit:{{shutdown, _},_} ->
+	    {error, closed}
+    end.
+
+start_timer(infinity, _) ->
+    undefined;
+start_timer(Timeout, Event) ->
+    erlang:send_after(Timeout, self(), {timer, Event}).
+
+cancel_timer(undefined) ->
+    ok;
+cancel_timer(Timer) ->
+    erlang:cancel_timer(Timer),
+    ok.
+

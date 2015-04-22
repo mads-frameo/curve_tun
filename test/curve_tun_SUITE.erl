@@ -53,7 +53,7 @@ all() ->
 send_recv(Config) ->
     SPid = sender(Config),
     RPid = receiver(Config),
-    ok = join([SPid, RPid]),
+    ok = join([RPid, SPid]),
     ok.
 
 %% -------------------------------------
@@ -85,6 +85,25 @@ sender(Config) ->
         sleep(),
         ok = curve_tun:send(Sock, <<"2">>),
         sleep(),
+
+        {ok, _Ref1} = curve_tun:async_recv(Sock, random:uniform(100)),
+        receive
+            {curve_tun, Sock, _Msg1} -> exit({unexpected_msg, _Msg1});
+            {curve_tun_async_timeout, Sock, _Ref1} -> ok
+        after 120 ->
+                exit(async_took_too_long)
+        end,
+        sleep(),
+
+        {ok, _} = curve_tun:async_recv(Sock),
+        receive
+            {curve_tun, Sock, _Msg2} -> exit({unexpected_msg, _Msg2});
+            {curve_tun_async_timeout, Sock, _} -> exit(unexpected_async_timeout)
+        after random:uniform(100) ->
+            ok
+        end,
+        sleep(),
+
         ok = curve_tun:send(Sock, <<"3">>),
         sleep(),
         ok = curve_tun:close(Sock),
@@ -106,7 +125,10 @@ receiver(Config) ->
         sleep(),
         {ok, <<"2">>} = curve_tun:recv(Sock),
         sleep(),
-        {ok, <<"3">>} = curve_tun:recv(Sock),
+        curve_tun:async_recv(Sock),
+        receive
+            {curve_tun, Sock, <<"3">>} -> ok
+        end,
         sleep(),
         ok = curve_tun:close(Sock),
         Ctl ! {self(), ok}
