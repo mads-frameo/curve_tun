@@ -210,17 +210,17 @@ handle_info({timer, connect_or_accept}, _Statename, State) ->
     {stop, normal, reply({error, timeout}, State)};
 handle_info({timer, {sync_recv, From}}, Statename, #{ recv_queue := Q } = State) ->
     gen_fsm:reply(From, {error, timeout}),
-    NewQ = queue:from_list(lists:foldr(fun(#{ from := F }, Acc) when F =:= From -> Acc;
-                                          (E, Acc) -> [E|Acc] end,
-                                       [],
+    NewQ = queue:from_list(lists:filter(fun(#{ from := F }) when F =:= From -> false;
+                                           (_) -> true
+                                        end,
                                        queue:to_list(Q))),
     {next_state, Statename, State#{ recv_queue => NewQ }};
 handle_info({timer, {async_recv, Ref}}, Statename, #{ recv_queue := Q, controller := {Controller,_} } = State) ->
     erlang:send(Controller, {curve_tun_async_timeout, {curve_tun_socket, self()}, Ref}),
-    NewQ = queue:from_list(lists:foldr(fun(#{ ref := R }, Acc) when R =:= Ref -> Acc;
-                                          (E, Acc) -> [E|Acc] end,
-                                       [],
-                                       queue:to_list(Q))),
+    NewQ = queue:from_list(lists:filter(fun(#{ ref := R }) when R =:= Ref -> false;
+                                           (_) -> true
+                                        end,
+                                        queue:to_list(Q))),
     {next_state, Statename, State#{ recv_queue => NewQ }};
 
 handle_info(Info, Statename, State) ->
