@@ -1,9 +1,9 @@
 -module(curve_tun_connection).
 -behaviour(gen_fsm).
 
--export([connect/3, accept/1, accept/2, listen/2, send/2, close/1,
+-export([connect/3, connect/4, accept/1, accept/2, listen/2, start/2, send/2, close/1,
          recv/1, recv/2, controlling_process/2,
-         metadata/1, async_recv/2
+         metadata/1, async_recv/2, async_cancel/1
         ]).
 
 %% Private callbacks
@@ -13,14 +13,13 @@
 -export([init/1, code_change/4, terminate/3, handle_info/3, handle_event/3, handle_sync_event/4]).
 
 -export([
-        accepting/2, connecting/2,
 	connected/2, connected/3,
 	awaiting_cookie/2, awaiting_cookie/3,
         awaiting_ready/2, awaiting_ready/3,
 	ready/2, ready/3
 ]).
 
--record(curve_tun_lsock, { lsock :: port (), metadata :: [{binary(),binary()}] }).
+-record(curve_tun_lsock, { lsock :: port (), options :: list() }).
 
 -record(curve_tun_socket, { pid :: pid() }).
 
@@ -30,17 +29,52 @@
 %% connection.
 -define(COUNT_LIMIT, 18446744073709551616 - 1).
 
-connect(Address, Port, Options) ->
-    connect(Address, Port, Options, infinity).
-
 connect(Address, Port, Options, Timeout) ->
-    {ok, Pid} = start_fsm(),
-    case sync_send_event(Pid, {connect, Address, Port, Options, Timeout}) of
-        ok ->
-            {ok, #curve_tun_socket { pid = Pid }};
+    connect(Address, Port, [{timeout, Timeout}|Options]).
+
+connect(Address, Port, Options) ->
+    {SocketOpts, TunOptions = #{ timeout := Timeout }} = filter_options(Options),
+    AbsTimeout = abs_timeout(Timeout),
+    case gen_tcp:connect(Address, Port, SocketOpts, Timeout) of
+        {ok, Socket} ->
+            start(Socket, TunOptions#{ mode => client, abs_timeout => AbsTimeout });
+        Err ->
+            Err
+    end.
+
+listen(Port, Opts) ->
+    {SocketOpts, TunOptions} = filter_options(Opts),
+    Options = [binary, {packet, 2}, {active, false} | SocketOpts],
+    case gen_tcp:listen(Port, Options) of
+        {ok, LSock} -> {ok, #curve_tun_lsock { lsock = LSock, options=TunOptions }};
+        {error, Reason} -> {error, Reason}
+    end.
+
+accept(#curve_tun_lsock { lsock = LSock, options=TunOptions=#{ timeout:=Timeout } }) ->
+    AbsTimeout = abs_timeout(Timeout),
+    case gen_tcp:accept( LSock ) of
+        {ok, Socket} ->
+            start(Socket, TunOptions#{ mode => server, abs_timeout => AbsTimeout });
         {error, Reason} ->
             {error, Reason}
     end.
+accept(#curve_tun_lsock{ lsock=LSock, options=TunOptions }, Timeout) ->
+    accept(#curve_tun_lsock{ lsock=LSock, options=TunOptions#{ timeout => Timeout }}).
+
+
+start(Socket, Options) when is_map(Options) ->
+    ok = inet:setopts(Socket, [binary, {packet, 2}, {active, false}]),
+    {ok, Pid} = start_fsm(),
+    ok = gen_tcp:controlling_process(Socket, Pid),
+    case sync_send_event(Pid, {start, Socket, Options}) of
+        ok ->
+            {ok, #curve_tun_socket{ pid = Pid }};
+        {error, Reason} ->
+            {error, Reason}
+    end;
+start(Socket, Opts) when is_list(Opts) ->
+    { _SocketOpts, TunOptions=#{ timeout := Timeout } } = filter_options(Opts),
+    start(Socket, TunOptions#{ abs_timeout => abs_timeout(Timeout) }).
 
 send(#curve_tun_socket { pid = Pid }, Msg) ->
     sync_send_event(Pid, {send, Msg}).
@@ -59,26 +93,6 @@ close(#curve_tun_socket { pid = Pid }) ->
             Other
     end.
 
-listen(Port, Opts) ->
-    {SocketOpts, #{ metadata := MD }} = filter_options(Opts),
-    Options = [binary, {packet, 2}, {active, false} | SocketOpts],
-    case gen_tcp:listen(Port, Options) of
-        {ok, LSock} -> {ok, #curve_tun_lsock { lsock = LSock, metadata = MD }};
-        {error, Reason} -> {error, Reason}
-    end.
-
-accept(#curve_tun_lsock { lsock = LSock, metadata = MD }, Timeout) ->
-    {ok, Pid} = start_fsm(),
-    case sync_send_event(Pid, {accept, LSock, MD, Timeout}) of
-       ok ->
-           {ok, #curve_tun_socket { pid = Pid }};
-       {error, Reason} ->
-           {error, Reason}
-   end.
-
-accept(State) ->
-   accept(State, infinity).
-
 controlling_process(#curve_tun_socket { pid = Pid }, Controller) ->
     sync_send_all_state_event(Pid, {controlling_process, Controller}).
 
@@ -88,6 +102,8 @@ metadata(#curve_tun_socket{ pid=Pid}) ->
 async_recv(#curve_tun_socket{ pid=Pid }, Timeout) ->
     sync_send_event(Pid, {async_recv, Timeout}).
 
+async_cancel({Pid,Ref}) ->
+    sync_send_event(Pid, {async_cancel, Ref}).
 
 %% @private
 start_fsm() ->
@@ -97,7 +113,7 @@ start_fsm() ->
 %% @private
 start_link(Controller) ->
     gen_fsm:start_link(?MODULE, [Controller], []).
-    
+
 %% @private
 init([Controller]) ->
     Ref = erlang:monitor(process, Controller),
@@ -110,42 +126,33 @@ init([Controller]) ->
 
 
 %% @private
-ready({accept, LSock, MetaData, Timeout}, From, State) ->
-    Timer = start_timer(Timeout, connect_or_accept),
-    ok = curve_tun_socket_helper:async_accept(LSock),
-    {next_state, accepting, State#{ from => From, md => MetaData, timer => Timer}};
-ready({connect, Address, Port, Options, Timeout}, From, State) ->
-    Timer = start_timer(Timeout, connect_or_accept),
-    {SocketOpts, #{ key := S, metadata := MD }} = filter_options(Options),
-    TcpOpts = [{packet, 2}, binary, {active, false} | SocketOpts],
-    ok = curve_tun_socket_helper:async_connect(Address, Port, TcpOpts),
-    {next_state, connecting, State#{ peer_lt_public_key => S, md => MD, from => From, timer => Timer }}.
-
-ready(_Msg, State) ->
-    {stop, argh, State}.
-
-connecting({connect, {ok, Socket}}, #{ peer_lt_public_key := S } = State) ->
+ready({start, Socket, #{ mode := client, metadata := MD, peer_public_key := S, abs_timeout := AbsTimeout }}, From, State) ->
+    Timer = start_timer(unabs_timeout(AbsTimeout), handshake),
     #{ public := EC, secret := ECs } = enacl:box_keypair(),
     case gen_tcp:send(Socket, e_hello(S, EC, ECs, 0)) of
         ok ->
             ok = inet:setopts(Socket, [{active, once}]),
             {next_state, awaiting_cookie, State#{
-                                       public_key => EC,
-                                       secret_key => ECs,
-                                       socket => Socket }};
+                                            peer_lt_public_key => S,
+                                            public_key => EC,
+                                            secret_key => ECs,
+                                            socket => Socket,
+                                            from => From,
+                                            timer => Timer,
+                                            md => MD }};
         {error, Reason} ->
             {stop, normal, reply({error, Reason}, State)}
     end;
-connecting({connect, {error, Reason}}, State) ->
-    {stop, normal, reply({error, Reason}, State)}.
-
-
-accepting({accept, {ok, Socket}}, State) ->
-    InitState = State#{ socket => Socket },
+ready({start, Socket, #{ mode := server, metadata := MD, abs_timeout := AbsTimeout }}, From, State) ->
+    Timer = start_timer(unabs_timeout(AbsTimeout), handshake),
     ok = inet:setopts(Socket, [{active, once}]),
-    {next_state, awaiting_hello, InitState};
-accepting({accept, {error, Reason}}, State) ->
-    {stop, normal, reply({error, Reason}, State)}.
+    {next_state, awaiting_hello, State#{ socket => Socket,
+                                         md => MD,
+                                         from => From,
+                                         timer => Timer }}.
+
+ready(_Msg, State) ->
+    {stop, argh, State}.
 
 awaiting_cookie(_Msg, _From, State) ->
     {stop, {unexpected_message, _Msg}, State}.
@@ -167,9 +174,16 @@ connected({recv, Timeout}, From, #{ recv_queue := Q } = State) ->
     process_recv_queue(State#{ recv_queue := queue:in(#{ type=>sync_recv, from => From, timer => Timer}, Q) });
 connected({async_recv, Timeout}, From, #{ recv_queue := Q } = State) ->
     Ref = make_ref(),
-    Timer = start_timer(Timeout, {async_recv, Ref}),
-    gen_fsm:reply(From, {ok, Ref}),
+    Timer = start_timer(Timeout, {async_recv, {self(), Ref}}),
+    gen_fsm:reply(From, {ok, {self(), Ref}}),
     process_recv_queue(State#{ recv_queue := queue:in(#{ type=>async_recv, ref => Ref, timer => Timer}, Q) });
+connected({async_cancel, Ref}, From, #{ recv_queue := Q } = State) ->
+    gen_fsm:reply(From, ok),
+    NewQ = queue:from_list(lists:filter(fun(#{ ref := R, timer := Timer }) when R =:= Ref ->  cancel_timer(Timer), false;
+                                           (_) -> true
+                                        end,
+                                       queue:to_list(Q))),
+    process_recv_queue(State#{ recv_queue := NewQ });
 
 connected({send, M}, _From, #{ socket := Socket, secret_key := Ks, peer_public_key := P, c := NonceCount, side := Side } = State) ->
     case gen_tcp:send(Socket, e_msg(M, Side, NonceCount, P, Ks)) of
@@ -206,7 +220,7 @@ handle_info({tcp_closed, Sock}, _Statename, #{ socket := Sock } = State) ->
     {stop, {shutdown, transport_closed}, maps:remove(socket, handle_unrecv_data(State))};
 handle_info({tcp_error, Sock, Reason}, _Statename, #{ socket := Sock } = State) ->
     {stop, {shutdown, {transport_error, Reason}}, maps:remove(socket, handle_unrecv_data(State))};
-handle_info({timer, connect_or_accept}, _Statename, State) ->
+handle_info({timer, handshake}, _Statename, State) ->
     {stop, normal, reply({error, timeout}, State)};
 handle_info({timer, {sync_recv, From}}, Statename, #{ recv_queue := Q } = State) ->
     gen_fsm:reply(From, {error, timeout}),
@@ -510,16 +524,23 @@ e_metadata([{Key,Value}|Rest], Data)
 %% Handle options.  This splits options into socket options and curve_tun options.
 
 filter_options(List) ->
-    filter_options(List, [], #{ metadata=>[] }).
+    filter_options(List, [], #{ metadata=>[], timeout => infinity, mode => client }).
 
 filter_options([], SO, CTO) ->
     {lists:reverse(SO), CTO};
 filter_options([KV={K,V}|Rest], SocketOpts, CurveOpts) ->
-    case lists:member(K, [metadata, key]) of
+    case lists:member(K, [metadata, peer_public_key, timeout, mode]) of
         true ->
             filter_options(Rest, SocketOpts, maps:put(K,V,CurveOpts));
         false ->
             filter_options(Rest, [KV|SocketOpts], CurveOpts)
+    end;
+filter_options([K|Rest], SocketOpts, CurveOpts) ->
+    case lists:member(K, [server, client]) of
+        true ->
+            filter_options(Rest, SocketOpts, maps:put(mode,K,CurveOpts));
+        false ->
+            filter_options(Rest, [K|SocketOpts], CurveOpts)
     end.
 
 %% UTILITY
@@ -560,3 +581,15 @@ cancel_timer(Timer) ->
     erlang:cancel_timer(Timer),
     ok.
 
+abs_timeout(infinity) ->
+    infinity;
+abs_timeout(Millis) when Millis > 0 ->
+    now_ms(erlang:now()) + Millis.
+
+unabs_timeout(infinity) ->
+    infinity;
+unabs_timeout(Absolute) ->
+    max(0, Absolute - now_ms(erlang:now())).
+
+now_ms({MegaSecs,Secs,MicroSecs}) ->
+    (MegaSecs*1000000 + Secs)*1000 + (MicroSecs div 1000).

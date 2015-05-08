@@ -77,7 +77,7 @@ sender(Config) ->
         ct:sleep(10),
         sleep(),
         {ok, Sock} = curve_tun:connect(?config(host, Config), ?config(port, Config),
-            [{key, ?config(receiver_pk, Config)}, {metadata, [{<<"a">>, <<"A">>}]}]),
+            [{peer_public_key, ?config(receiver_pk, Config)}, {metadata, [{<<"a">>, <<"A">>}]}, {timeout, 3000}]),
         sleep(),
         {ok, [{<<"b">>, <<"B">>}]} = curve_tun:metadata(Sock),
         sleep(),
@@ -86,7 +86,7 @@ sender(Config) ->
         ok = curve_tun:send(Sock, <<"2">>),
         sleep(),
 
-        {ok, _Ref1} = curve_tun:async_recv(Sock, random:uniform(100)),
+        {ok, _Ref1} = curve_tun:async_recv(Sock, random:uniform(100)-1),
         receive
             {curve_tun, Sock, _Msg1} -> exit({unexpected_msg, _Msg1});
             {curve_tun_async_timeout, Sock, _Ref1} -> ok
