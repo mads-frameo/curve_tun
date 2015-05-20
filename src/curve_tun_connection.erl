@@ -339,19 +339,27 @@ handle_vouch(K, 1, Box, #{ socket := Sock, vault := Vault, registry := Registry,
         {ok, EC, ESs} ->
             Nonce = st_nonce(initiate, client, 1),
             {ok, <<C:32/binary, NonceLT:16/binary, Vouch:48/binary, MetaData/binary>>} = enacl:box_open(Box, Nonce, EC, ESs),
-            MDIn = d_metadata(MetaData),
             true = Registry:verify(Sock, C),
             VNonce = lt_nonce(client, NonceLT),
             {ok, <<EC:32/binary>>} = Vault:box_open(Vouch, VNonce, C),
 
-            case gen_tcp:send(Sock, e_ready(MDOut, 2, EC, ESs)) of
-                ok ->
+            case MetaData of
+                <<>> -> % client didn't send meta data
                     %% Everything seems to be in order, go to connected state
-                    NState = State#{ recv_queue => queue:new(), buf => undefined, rmd => MDIn,
+                    NState = State#{ recv_queue => queue:new(), buf => undefined, rmd => [],
                                      secret_key => ESs, peer_public_key => EC, c => 3, rc => 2, side => server },
                     {next_state, connected, reply(ok, NState)};
-                {error, _Reason} = Err ->
-                    {stop, Err, State}
+                _ ->
+                    MDIn = d_metadata(MetaData),
+                    case gen_tcp:send(Sock, e_ready(MDOut, 2, EC, ESs)) of
+                        ok ->
+                            %% Everything seems to be in order, go to connected state
+                            NState = State#{ recv_queue => queue:new(), buf => undefined, rmd => MDIn,
+                                             secret_key => ESs, peer_public_key => EC, c => 3, rc => 2, side => server },
+                            {next_state, connected, reply(ok, NState)};
+                        {error, _Reason} = Err ->
+                            {stop, Err, State}
+                    end
             end;
 
         {error, _Reason} = Err ->
