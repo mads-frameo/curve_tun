@@ -28,11 +28,14 @@ lookup(IP) ->
     gen_server:call(?SERVER, {lookup, IP}).
 
 verify(Socket, PubKey) ->
-    {ok, {Address, _Port}} = inet:peername(Socket),
-    case lookup(Address) of
-        {ok, Key} -> PubKey =:= Key;
-        {error, not_found} -> false
-    end.
+    %% TODO: check a blacklist maybe?
+    ok.
+
+%    {ok, {Address, _Port}} = inet:peername(Socket),
+%    case lookup(Address) of
+%        {ok, Key} -> PubKey =:= Key;
+%        {error, not_found} -> false
+%    end.
         
 %% Callbacks
 
