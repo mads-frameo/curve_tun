@@ -29,7 +29,7 @@ lookup(IP) ->
 
 verify(Socket, PubKey) ->
     %% TODO: check a blacklist maybe?
-    ok.
+    true.
 
 %    {ok, {Address, _Port}} = inet:peername(Socket),
 %    case lookup(Address) of

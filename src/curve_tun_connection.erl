@@ -1,13 +1,14 @@
 -module(curve_tun_connection).
 -behaviour(gen_fsm).
 
--export([connect/3, connect/4, accept/1, accept/2, listen/2, start/2, send/2, close/1,
+-export([connect/3, connect/4, transport_accept/1, handshake/2, accept/1, accept/2, listen/2, start/2, send/2, close/1,
          recv/1, recv/2, controlling_process/2,
-         metadata/1, async_recv/2, async_cancel/1
+         metadata/1, 
+         peername/1, setopts/2, peer_public_key/1
         ]).
 
 %% Private callbacks
--export([start_fsm/0, start_link/1]).
+-export([start_fsm/1, start_link/2]).
 
 %% FSM callbacks
 -export([init/1, code_change/4, terminate/3, handle_info/3, handle_event/3, handle_sync_event/4]).
@@ -28,6 +29,17 @@
 %% a year if you manage to send 584 billion messages per second on a single
 %% connection.
 -define(COUNT_LIMIT, 18446744073709551616 - 1).
+
+-define(UCS_FISH,    16#f0, 16#9f, 16#90, 16#9f).
+
+-define(TELL_TAG,    ?UCS_FISH, "TELL").
+-define(WELCOME_TAG, ?UCS_FISH, "WELC").
+-define(HELLO_TAG,   ?UCS_FISH, "HELO").
+-define(COOKIE_TAG,  ?UCS_FISH, "COOK").
+-define(VOUCH_TAG,   ?UCS_FISH, "VOCH").
+-define(READY_TAG,   ?UCS_FISH, "REDY").
+-define(MESSAGE_TAG, ?UCS_FISH, "MESG").
+-define(BYE_TAG,     ?UCS_FISH, "BYE!").
 
 connect(Address, Port, Options, Timeout) ->
     connect(Address, Port, [{timeout, Timeout}|Options]).
@@ -62,11 +74,37 @@ accept(#curve_tun_lsock{ lsock=LSock, options=TunOptions }, Timeout) ->
     accept(#curve_tun_lsock{ lsock=LSock, options=TunOptions#{ timeout => Timeout }}).
 
 
+transport_accept(#curve_tun_lsock { lsock = LSock, options=TunOptions }) ->
+    case gen_tcp:accept( LSock ) of
+        {ok, Socket} ->
+            ok = inet:setopts(Socket, [{nodelay, true}, binary,
+                                       {packet, 2}, {active, false}]),
+            {ok, Pid} = start_fsm(Socket),
+            ok = gen_tcp:controlling_process(Socket, Pid),
+            case sync_send_event(Pid, {set_options, TunOptions}) of
+                ok ->
+                    {ok, #curve_tun_socket{ pid = Pid }};
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+handshake(#curve_tun_socket{ pid = Pid }, #{mode :=_ } = Options) ->
+    TimeOut = case Options of
+                  #{ timeout := TO } -> TO;
+                  _ -> infinity
+              end,
+    sync_send_event(Pid, {handshake,
+                          Options#{ timeout=>TimeOut,
+                                    abs_timeout=>abs_timeout(TimeOut) }}).
+
 start(Socket, Options) when is_map(Options) ->
-    ok = inet:setopts(Socket, [binary, {packet, 2}, {active, false}]),
-    {ok, Pid} = start_fsm(),
+    ok = inet:setopts(Socket, [{nodelay, true}, binary, {packet, 2}, {active, false}]),
+    {ok, Pid} = start_fsm(Socket),
     ok = gen_tcp:controlling_process(Socket, Pid),
-    case sync_send_event(Pid, {start, Socket, Options}) of
+    case sync_send_event(Pid, {start, Options}) of
         ok ->
             {ok, #curve_tun_socket{ pid = Pid }};
         {error, Reason} ->
@@ -74,7 +112,11 @@ start(Socket, Options) when is_map(Options) ->
     end;
 start(Socket, Opts) when is_list(Opts) ->
     { _SocketOpts, TunOptions=#{ timeout := Timeout } } = filter_options(Opts),
-    start(Socket, TunOptions#{ abs_timeout => abs_timeout(Timeout) }).
+    start(Socket, TunOptions#{ abs_timeout => abs_timeout(Timeout) });
+start(Socket, Opts) when is_integer(Opts) ->
+    { _SocketOpts, TunOptions} = filter_options([]),
+    start(Socket, TunOptions#{ abs_timeout => abs_timeout(Opts) }).
+
 
 send(#curve_tun_socket { pid = Pid }, Msg) ->
     sync_send_event(Pid, {send, Msg}).
@@ -84,6 +126,17 @@ recv(#curve_tun_socket { pid = Pid }, Timeout) ->
 
 recv(State) ->
     recv(State, infinity).
+
+peer_public_key(#curve_tun_socket{ pid=Pid }) ->
+    sync_send_all_state_event(Pid, peer_public_key).
+
+peername(#curve_tun_socket { pid = Pid }) ->
+    sync_send_all_state_event(Pid, peername);
+peername(Sock) when is_port(Sock) ->
+    inet:peername(Sock).
+
+setopts(#curve_tun_socket{ pid=Pid}, Opts) ->
+    sync_send_event(Pid, {setopts, Opts}).
 
 close(#curve_tun_socket { pid = Pid }) ->
     case sync_send_all_state_event(Pid, close) of
@@ -99,34 +152,38 @@ controlling_process(#curve_tun_socket { pid = Pid }, Controller) ->
 metadata(#curve_tun_socket{ pid=Pid}) ->
     sync_send_event(Pid, metadata).
 
-async_recv(#curve_tun_socket{ pid=Pid }, Timeout) ->
-    sync_send_event(Pid, {async_recv, Timeout}).
-
-async_cancel({Pid,Ref}) ->
-    sync_send_event(Pid, {async_cancel, Ref}).
-
 %% @private
-start_fsm() ->
+start_fsm(Socket) ->
     Controller = self(),
-    curve_tun_connection_sup:start_child([Controller]).
+    curve_tun_connection_sup:start_child([Controller, Socket]).
 
 %% @private
-start_link(Controller) ->
-    gen_fsm:start_link(?MODULE, [Controller], []).
+start_link(Controller, Socket) ->
+    gen_fsm:start_link(?MODULE, [Controller, Socket], []).
 
 %% @private
-init([Controller]) ->
+init([Controller,Socket]) ->
     Ref = erlang:monitor(process, Controller),
     State = #{
         vault => curve_tun_vault_dummy,
         registry => curve_tun_simple_registry,
-        controller => {Controller, Ref}
+        controller => {Controller, Ref},
+        socket => Socket,
+        metadata => []
     },
     {ok, ready, State}.
 
 
 %% @private
-ready({start, Socket, #{ mode := client, metadata := MD, peer_public_key := S, abs_timeout := AbsTimeout }}, From, State) ->
+ready({set_options, Options}, From, State) ->
+    gen_fsm:reply(From, ok),
+    State2 = lists:foldl(fun({K,V}, S) ->
+                                 maps:put(K,V,S)
+                         end,
+                         State,
+                         maps:to_list(Options)),
+    {next_state, ready, State2};
+ready({handshake, #{ mode := client, metadata := MD, peer_public_key := S, abs_timeout := AbsTimeout }}, From, #{socket := Socket }=State) ->
     Timer = start_timer(unabs_timeout(AbsTimeout), handshake),
     #{ public := EC, secret := ECs } = enacl:box_keypair(),
     case gen_tcp:send(Socket, e_hello(S, EC, ECs, 0)) of
@@ -143,11 +200,12 @@ ready({start, Socket, #{ mode := client, metadata := MD, peer_public_key := S, a
         {error, Reason} ->
             {stop, normal, reply({error, Reason}, State)}
     end;
-ready({start, Socket, #{ mode := server, metadata := MD, abs_timeout := AbsTimeout }}, From, State) ->
+ready({handshake, Opts=#{ mode := server, abs_timeout := AbsTimeout }}, From, 
+ #{ socket := Socket } = State) ->
     Timer = start_timer(unabs_timeout(AbsTimeout), handshake),
     ok = inet:setopts(Socket, [{active, once}]),
     {next_state, awaiting_hello, State#{ socket => Socket,
-                                         md => MD,
+                                         md => case maps:find(metadata, Opts) of {ok, MD} -> MD; error -> [] end,
                                          from => From,
                                          timer => Timer }}.
 
@@ -172,26 +230,41 @@ connected(_M, State) ->
 connected({recv, Timeout}, From, #{ recv_queue := Q } = State) ->
     Timer = start_timer(Timeout, {sync_recv, From}),
     process_recv_queue(State#{ recv_queue := queue:in(#{ type=>sync_recv, from => From, timer => Timer}, Q) });
-connected({async_recv, Timeout}, From, #{ recv_queue := Q } = State) ->
-    Ref = make_ref(),
-    Timer = start_timer(Timeout, {async_recv, {self(), Ref}}),
-    gen_fsm:reply(From, {ok, {self(), Ref}}),
-    process_recv_queue(State#{ recv_queue := queue:in(#{ type=>async_recv, ref => Ref, timer => Timer}, Q) });
-connected({async_cancel, Ref}, From, #{ recv_queue := Q } = State) ->
-    gen_fsm:reply(From, ok),
-    NewQ = queue:from_list(lists:filter(fun(#{ ref := R, timer := Timer }) when R =:= Ref ->  cancel_timer(Timer), false;
-                                           (_) -> true
-                                        end,
-                                       queue:to_list(Q))),
-    process_recv_queue(State#{ recv_queue := NewQ });
-
 connected({send, M}, _From, #{ socket := Socket, secret_key := Ks, peer_public_key := P, c := NonceCount, side := Side } = State) ->
-    case gen_tcp:send(Socket, e_msg(M, Side, NonceCount, P, Ks)) of
+    Len = byte_size(M),
+    case gen_tcp:send(Socket, e_msg(<<Len:16, M/binary>>, Side, NonceCount, P, Ks)) of
          ok -> {reply, ok, connected, State#{ c := NonceCount + 1}};
          {error, _Reason} = Err -> {reply, Err, connected, State}
     end;
 connected(metadata, _From, #{ rmd := MetaData } = State) ->
-    {reply, {ok, MetaData}, connected, State}.
+    {reply, {ok, MetaData}, connected, State};
+connected(peername, _From, #{socket := Socket} = State) ->
+    {reply, inet:peername(Socket), connected, State};
+connected({setopts, Opts}, From, #{socket := Socket} = State) ->
+    case lists:foldl(fun(_, E={_, _}) -> E;
+                        ({packet, 2}, S) -> S;
+                        (binary, S) -> S;
+                        (O={nodelay, _}, S) ->
+                             case inet:setopts(Socket, [O]) of
+                                 ok -> S;
+                                 E={error, _} -> {E,S}
+                             end;
+                        ({active, Val}, S) when Val =:= true; Val =:= false; Val =:= once ->
+                             S#{ active => Val };
+                        (Opt, S) ->
+                             {{error, {unknown_opt, Opt}}, S}
+                     end,
+                     State,
+                     Opts) of
+        {E,State2} ->
+            gen_fsm:reply(From, E),
+            process_recv_queue(State2);
+        State2 ->
+            gen_fsm:reply(From, ok),
+            process_recv_queue(State2)
+    end.
+
+
 
 handle_sync_event({controlling_process, Controller}, {PrevController, _Tag}, Statename,
         #{ controller := {PrevController, MRef} } = State) ->
@@ -203,6 +276,12 @@ handle_sync_event({controlling_process, _Controller}, _From, Statename, State) -
 handle_sync_event(close, _From, _StateName, #{ socket:=Socket } = State) ->
     gen_tcp:close(Socket),
     {stop, normal, ok, maps:remove(socket, State) };
+handle_sync_event(peername, From, Statename, #{ socket := Socket }=State) ->
+    gen_fsm:reply(From, inet:peername(Socket)),
+    {next_state, Statename, State};
+handle_sync_event(peer_public_key, From, Statename, #{ peer_public_key := Key }=State) ->
+    gen_fsm:reply(From, {ok, Key}),
+    {next_state, Statename, State};
 handle_sync_event(Event, _From, Statename, State) ->
     error_logger:info_msg("Unknown sync_event ~p in state ~p", [Event, Statename]),
     {next_state, Statename, State}.
@@ -229,14 +308,6 @@ handle_info({timer, {sync_recv, From}}, Statename, #{ recv_queue := Q } = State)
                                         end,
                                        queue:to_list(Q))),
     {next_state, Statename, State#{ recv_queue => NewQ }};
-handle_info({timer, {async_recv, Ref}}, Statename, #{ recv_queue := Q, controller := {Controller,_} } = State) ->
-    erlang:send(Controller, {curve_tun_async_timeout, {curve_tun_socket, self()}, Ref}),
-    NewQ = queue:from_list(lists:filter(fun(#{ ref := R }) when R =:= Ref -> false;
-                                           (_) -> true
-                                        end,
-                                        queue:to_list(Q))),
-    {next_state, Statename, State#{ recv_queue => NewQ }};
-
 handle_info(Info, Statename, State) ->
     error_logger:info_msg("Unknown info msg ~p in state ~p", [Info, Statename]),
     {next_state, Statename, State}.
@@ -257,20 +328,18 @@ code_change(_OldVsn, Statename, State, _Aux) ->
 
 %% INTERNAL HANDLERS
 
-handle_unrecv_data(#{ recv_queue := Q, controller := {Controller,_} } = State) ->
+handle_unrecv_data(#{ recv_queue := Q, controller := {Controller,_}, active := Active } = State) ->
 
     %% reply {error, closed} to all sync callers
     [ gen_fsm:reply(Receiver, {error, closed}) || #{ type := sync_recv, from := Receiver } <- queue:to_list(Q) ],
 
-
-    %% if there is at least one async receive pending, notify controller (once)
-    case [ ok || #{ type := async_recv } <- queue:to_list(Q) ] of
-        [] ->
+    case Active of
+        false ->
             ok;
-        _ ->
+        _     ->
             erlang:send(Controller, {curve_tun_closed, {curve_tun_socket,self()}})
     end,
-    State#{ recv_queue=>queue:new() };
+    State#{ recv_queue=>queue:new(), active => true };
 handle_unrecv_data(State) ->
     State.
 
@@ -302,23 +371,36 @@ reply(M, #{ from := From } = State) ->
 %% Analyze the current waiting receivers and the buffer state. If there is a receiver for the buffered
 %% message, then send the message back the receiver.
 %% @end
-process_recv_queue(#{ recv_queue := Q, buf := Buf, socket := Sock, controller := {Controller,_} } = State) ->
+process_recv_queue(#{ recv_queue := Q, buf := Buf, socket := Sock, controller := {Controller,_}, active := Active } = State) ->
+%    io:format(user, "process_queue(~p)~n", [State]),
     case {queue:out(Q), Buf} of
+
         {{{value, _Receiver}, _Q2}, undefined} ->
             ok = inet:setopts(Sock, [{active, once}]),
             {next_state, connected, State};
+        {_, undefined} when Active =/= false ->
+            ok = inet:setopts(Sock, [{active, once}]),
+            {next_state, connected, State};
+
         {{{value, #{ type := sync_recv, from := Receiver, timer := Timer }}, Q2}, Msg} ->
             cancel_timer(Timer),
             gen_fsm:reply(Receiver, {ok, Msg}),
             process_recv_queue(State#{ recv_queue := Q2, buf := undefined });
-        {{{value, #{ type := async_recv, ref := _Ref, timer := Timer }}, Q2}, Msg} ->
-            cancel_timer(Timer),
+
+        {_, Msg} when Active == true ->
             AM = {curve_tun, {curve_tun_socket,self()}, Msg},
             erlang:send(Controller, AM),
-            process_recv_queue(State#{ recv_queue := Q2, buf := undefined });
-        {{empty, _Q2}, _} ->
+            ok = inet:setopts(Sock, [{active, once}]),
+            process_recv_queue(State#{ buf := undefined });
+
+        {_, Msg} when Active == once ->
+            AM = {curve_tun, {curve_tun_socket,self()}, Msg},
+            erlang:send(Controller, AM),
+            process_recv_queue(State#{ active := false, buf := undefined });
+
+        {_, _} ->
             {next_state, connected, State}
-   end.
+    end.
 
 handle_msg(?COUNT_LIMIT, _Box, _State) -> exit(count_limit);
 handle_msg(N, Box, #{
@@ -331,7 +413,7 @@ handle_msg(N, Box, #{
                 client -> st_nonce(msg, server, N);
                 server -> st_nonce(msg, client, N)
             end,
-    {ok, Msg} = enacl:box_open(Box, Nonce, P, Ks),
+    {ok, <<Len:16, Msg:Len/binary>>} = enacl:box_open(Box, Nonce, P, Ks),
     process_recv_queue(State#{ buf := Msg, rc := N+1 }).
 
 handle_vouch(K, 1, Box, #{ socket := Sock, vault := Vault, registry := Registry, md := MDOut } = State) ->
@@ -347,16 +429,16 @@ handle_vouch(K, 1, Box, #{ socket := Sock, vault := Vault, registry := Registry,
                 <<>> -> % client didn't send meta data
                     %% Everything seems to be in order, go to connected state
                     NState = State#{ recv_queue => queue:new(), buf => undefined, rmd => [],
-                                     secret_key => ESs, peer_public_key => EC, c => 3, rc => 2, side => server },
-                    {next_state, connected, reply(ok, NState)};
+                                     secret_key => ESs, peer_public_key => EC, c => 3, rc => 2, side => server, active => false },
+                    process_recv_queue(reply(ok, NState));
                 _ ->
                     MDIn = d_metadata(MetaData),
                     case gen_tcp:send(Sock, e_ready(MDOut, 2, EC, ESs)) of
                         ok ->
                             %% Everything seems to be in order, go to connected state
                             NState = State#{ recv_queue => queue:new(), buf => undefined, rmd => MDIn,
-                                             secret_key => ESs, peer_public_key => EC, c => 3, rc => 2, side => server },
-                            {next_state, connected, reply(ok, NState)};
+                                             secret_key => ESs, peer_public_key => EC, c => 3, rc => 2, side => server, active => false },
+                            process_recv_queue(reply(ok, NState));
                         {error, _Reason} = Err ->
                             {stop, Err, State}
                     end
@@ -449,7 +531,7 @@ lt_nonce(server, N) -> <<"CurveCPK", N/binary>>.
 e_hello(S, EC, ECs, N) ->
     Nonce = st_nonce(hello, client, N),
     Box = enacl:box(binary:copy(<<0>>, 64), Nonce, S, ECs),
-    <<108,9,175,178,138,169,250,252, EC:32/binary, N:64/integer, Box/binary>>.
+    <<?HELLO_TAG, EC:32/binary, N:64/integer, Box/binary>>.
 
 e_cookie(EC, ES, ESs, Vault) ->
     Ts = curve_tun_cookie:current_key(),
@@ -460,7 +542,7 @@ e_cookie(EC, ES, ESs, Vault) ->
     K = <<SafeNonce:16/binary, KBox/binary>>,
     BoxNonce = lt_nonce(server, SafeNonce),
     Box = Vault:box(<<ES:32/binary, K/binary>>, BoxNonce, EC),
-    <<28,69,220,185,65,192,227,246, SafeNonce:16/binary, Box/binary>>.
+    <<?COOKIE_TAG, SafeNonce:16/binary, Box/binary>>.
 
 e_vouch(Kookie, VMsg, S, Vault, N, ES, ECs, MD) when byte_size(Kookie) == 96 ->
     NonceBase = Vault:safe_nonce(),
@@ -473,35 +555,39 @@ e_vouch(Kookie, VMsg, S, Vault, N, ES, ECs, MD) when byte_size(Kookie) == 96 ->
     STNonce = st_nonce(initiate, client, N),
     MetaData = e_metadata(MD),
     Box = enacl:box(<<C:32/binary, NonceBase/binary, VouchBox:48/binary, MetaData/binary>>, STNonce, ES, ECs),
-    <<108,9,175,178,138,169,250,253, Kookie/binary, N:64/integer, Box/binary>>.
+    <<?VOUCH_TAG, Kookie/binary, N:64/integer, Box/binary>>.
 
 e_ready(MetaData, NonceCount, PK, SK) ->
     Nonce = st_nonce(ready, server, NonceCount),
     Box = enacl:box(e_metadata(MetaData), Nonce, PK, SK),
-    <<109,9,175,178,138,169,250,253, NonceCount:64/integer, Box/binary>>.
+    <<?READY_TAG, NonceCount:64/integer, Box/binary>>.
 
 e_msg(M, Side, NonceCount, PK, SK) ->
     Nonce = st_nonce(msg, Side, NonceCount),
     Box = enacl:box(M, Nonce, PK, SK),
-    <<109,27,57,203,246,90,17,180, NonceCount:64/integer, Box/binary>>.
+    <<?MESSAGE_TAG, NonceCount:64/integer, Box/binary>>.
 
 %% PACKET DECODING
 %%
 %% To make it easy to understand what is going on, keep the packet decoder
 %% close the to encoding of messages. The above layers then handle the
 %% semantics of receiving and sending commands/packets over the wire
-d_packet(<<109,27,57,203,246,90,17,180, N:64/integer, Box/binary>>) ->
+d_packet(<<?MESSAGE_TAG, N:64/integer, Box/binary>>) ->
     {msg, N, Box};
-d_packet(<<108,9,175,178,138,169,250,253, K:96/binary, N:64/integer, Box/binary>>) ->
+d_packet(<<?VOUCH_TAG, K:96/binary, N:64/integer, Box/binary>>) ->
     {vouch, K, N, Box};
-d_packet(<<28,69,220,185,65,192,227,246,  N:16/binary, Box/binary>>) ->
+d_packet(<<?COOKIE_TAG, N:16/binary, Box/binary>>) ->
     {cookie, N, Box};
-d_packet(<<108,9,175,178,138,169,250,252, EC:32/binary, N:64/integer, Box/binary>>) ->
+d_packet(<<?HELLO_TAG, EC:32/binary, N:64/integer, Box/binary>>) ->
     {hello, EC, N, Box};
-d_packet(<<109,9,175,178,138,169,250,253, N:64/integer, Box/binary>>) ->
+d_packet(<<?READY_TAG, N:64/integer, Box/binary>>) ->
     {ready, N, Box};
-d_packet(_) ->
-    unknown.
+d_packet(<<?TELL_TAG>>) ->
+    tell;
+d_packet(<<?WELCOME_TAG, S:32/binary>>) ->
+    {welcome, S};
+d_packet(Bin) ->
+    {unknown, Bin}.
     
 
 %% METADATA CODING
@@ -532,12 +618,12 @@ e_metadata([{Key,Value}|Rest], Data)
 %% Handle options.  This splits options into socket options and curve_tun options.
 
 filter_options(List) ->
-    filter_options(List, [], #{ metadata=>[], timeout => infinity, mode => client }).
+    filter_options(List, [], #{ metadata=>[], timeout => infinity, mode => client, active => false }).
 
 filter_options([], SO, CTO) ->
     {lists:reverse(SO), CTO};
 filter_options([KV={K,V}|Rest], SocketOpts, CurveOpts) ->
-    case lists:member(K, [metadata, peer_public_key, timeout, mode]) of
+    case lists:member(K, [metadata, peer_public_key, timeout, mode, active]) of
         true ->
             filter_options(Rest, SocketOpts, maps:put(K,V,CurveOpts));
         false ->
