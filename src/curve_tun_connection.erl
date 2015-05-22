@@ -1,14 +1,14 @@
 -module(curve_tun_connection).
 -behaviour(gen_fsm).
 
--export([connect/3, connect/4, transport_accept/1, handshake/2, accept/1, accept/2, listen/2, start/2, send/2, close/1,
+-export([connect/3, connect/4, transport_accept/2, handshake/3, handshake/4, accept/1, accept/2, listen/2, send/2, close/1,
          recv/1, recv/2, controlling_process/2,
          metadata/1, 
          peername/1, setopts/2, peer_public_key/1
         ]).
 
 %% Private callbacks
--export([start_fsm/1, start_link/2]).
+-export([start_fsm/2, start_link/3]).
 
 %% FSM callbacks
 -export([init/1, code_change/4, terminate/3, handle_info/3, handle_event/3, handle_sync_event/4]).
@@ -32,91 +32,122 @@
 
 -define(UCS_FISH,    16#f0, 16#9f, 16#90, 16#9f).
 
--define(TELL_TAG,    ?UCS_FISH, "TELL").
--define(WELCOME_TAG, ?UCS_FISH, "WELC").
--define(HELLO_TAG,   ?UCS_FISH, "HELO").
+-define(TELL_TAG,    ?UCS_FISH, "TELL"). %% please reveal public permanent key
+-define(WELCOME_TAG, ?UCS_FISH, "WELC"). %% provide public ephemeral key
+-define(HELLO_TAG,   ?UCS_FISH, "HELO"). %% 
 -define(COOKIE_TAG,  ?UCS_FISH, "COOK").
 -define(VOUCH_TAG,   ?UCS_FISH, "VOCH").
 -define(READY_TAG,   ?UCS_FISH, "REDY").
 -define(MESSAGE_TAG, ?UCS_FISH, "MESG").
 -define(BYE_TAG,     ?UCS_FISH, "BYE!").
 
-connect(Address, Port, Options, Timeout) ->
-    connect(Address, Port, [{timeout, Timeout}|Options]).
+%%
+%% tries to mimick the behavior of public methods for ssl
+%%
 
-connect(Address, Port, Options) ->
-    {SocketOpts, TunOptions = #{ timeout := Timeout }} = filter_options(Options),
-    AbsTimeout = abs_timeout(Timeout),
-    case gen_tcp:connect(Address, Port, SocketOpts, Timeout) of
+connect(Address, Port, Options) when is_list(Options) ->
+    connect(Address, Port, Options, infinity);
+
+connect(Port, Options, Timeout) when is_port(Port) ->
+    { TcpOpts, TunOptions } = filter_options(Options),
+    connect2(Port, TcpOpts, TunOptions, Timeout).
+
+connect(Address, Port, Options, Timeout) ->
+    { TcpOpts, TunOptions } = filter_options(Options),
+    BeforeTime = erlang:now(),
+    case gen_tcp:connect(Address, Port, [{active, false} | TcpOpts ], Timeout) of
         {ok, Socket} ->
-            start(Socket, TunOptions#{ mode => client, abs_timeout => AbsTimeout });
-        Err ->
+            case millis_left(BeforeTime, Timeout) of
+                0 ->
+                    ok = gen_tcp:close(Socket),
+                    {error, timeout};
+                TimeLeft ->
+                    connect2(Socket, [], TunOptions, TimeLeft)
+            end;
+        {error,_}=Err ->
             Err
     end.
 
-listen(Port, Opts) ->
-    {SocketOpts, TunOptions} = filter_options(Opts),
-    Options = [binary, {packet, 2}, {active, false} | SocketOpts],
-    case gen_tcp:listen(Port, Options) of
-        {ok, LSock} -> {ok, #curve_tun_lsock { lsock = LSock, options=TunOptions }};
-        {error, Reason} -> {error, Reason}
-    end.
-
-accept(#curve_tun_lsock { lsock = LSock, options=TunOptions=#{ timeout:=Timeout } }) ->
-    AbsTimeout = abs_timeout(Timeout),
-    case gen_tcp:accept( LSock ) of
-        {ok, Socket} ->
-            start(Socket, TunOptions#{ mode => server, abs_timeout => AbsTimeout });
-        {error, Reason} ->
-            {error, Reason}
-    end.
-accept(#curve_tun_lsock{ lsock=LSock, options=TunOptions }, Timeout) ->
-    accept(#curve_tun_lsock{ lsock=LSock, options=TunOptions#{ timeout => Timeout }}).
-
-
-transport_accept(#curve_tun_lsock { lsock = LSock, options=TunOptions }) ->
-    case gen_tcp:accept( LSock ) of
-        {ok, Socket} ->
-            ok = inet:setopts(Socket, [{nodelay, true}, binary,
-                                       {packet, 2}, {active, false}]),
-            {ok, Pid} = start_fsm(Socket),
-            ok = gen_tcp:controlling_process(Socket, Pid),
-            case sync_send_event(Pid, {set_options, TunOptions}) of
-                ok ->
-                    {ok, #curve_tun_socket{ pid = Pid }};
-                {error, Reason} ->
-                    {error, Reason}
-            end;
-        {error, Reason} ->
-            {error, Reason}
-    end.
-
-handshake(#curve_tun_socket{ pid = Pid }, #{mode :=_ } = Options) ->
-    TimeOut = case Options of
-                  #{ timeout := TO } -> TO;
-                  _ -> infinity
-              end,
-    sync_send_event(Pid, {handshake,
-                          Options#{ timeout=>TimeOut,
-                                    abs_timeout=>abs_timeout(TimeOut) }}).
-
-start(Socket, Options) when is_map(Options) ->
-    ok = inet:setopts(Socket, [{nodelay, true}, binary, {packet, 2}, {active, false}]),
-    {ok, Pid} = start_fsm(Socket),
-    ok = gen_tcp:controlling_process(Socket, Pid),
-    case sync_send_event(Pid, {start, Options}) of
+connect2(Port, TcpOpts, TunOpts, Timeout) when is_port(Port) ->
+    ok = gen_tcp:setopts( Port, TcpOpts ),
+    {ok, Pid} = start_fsm( Port, TunOpts ),
+    ok = gen_tcp:controlling_process( Port, Pid ),
+    Socket = #curve_tun_socket{ pid = Pid },
+    case handshake(Socket, client, Timeout) of
         ok ->
-            {ok, #curve_tun_socket{ pid = Pid }};
+            {ok, Socket};
+        {error,_}=Err ->
+            Err
+    end.
+
+listen(Port, Opts) when is_list(Opts) ->
+    {TcpOpts, TunOptions} = filter_options(Opts),
+    Options = [binary, {packet, 2}, {active, false} | TcpOpts],
+    case gen_tcp:listen(Port, Options) of
+        {ok, LSock} ->
+            {ok, #curve_tun_lsock { lsock = LSock, options=TunOptions }};
+        {error,_}=Err ->
+            Err
+    end.
+
+accept(LSock=#curve_tun_lsock{}, Timeout) ->
+    BeforeTime = erlang:now(),
+    case transport_accept( LSock, Timeout ) of
+        {ok, Socket} ->
+            case millis_left(BeforeTime, Timeout) of
+                0 ->
+                    ok = close(Socket),
+                    {error, timeout};
+                TimeLeft ->
+                    case handshake(Socket, server, TimeLeft) of
+                        ok ->
+                            {ok, Socket};
+                        {error, _}=Err ->
+                            Err
+                    end
+            end;
+        {error, _}=Err ->
+            Err
+    end;
+accept(LSock, Timeout) when is_port(LSock) ->
+    accept(#curve_tun_lsock{ lsock=LSock, options = [] }, Timeout).
+
+accept(LSock) ->
+    accept(LSock, infinity).
+
+transport_accept(#curve_tun_lsock { lsock = LSock, options=TunOptions }, Timeout) ->
+    case gen_tcp:accept( LSock, Timeout ) of
+        {ok, Socket} ->
+            wrap(Socket, TunOptions);
         {error, Reason} ->
             {error, Reason}
-    end;
-start(Socket, Opts) when is_list(Opts) ->
-    { _SocketOpts, TunOptions=#{ timeout := Timeout } } = filter_options(Opts),
-    start(Socket, TunOptions#{ abs_timeout => abs_timeout(Timeout) });
-start(Socket, Opts) when is_integer(Opts) ->
-    { _SocketOpts, TunOptions} = filter_options([]),
-    start(Socket, TunOptions#{ abs_timeout => abs_timeout(Opts) }).
+    end.
 
+-spec handshake(#curve_tun_socket{}, client|server, non_neg_integer() | infinity) -> ok | {error, term()}.
+handshake(#curve_tun_socket{ pid = Pid }, Role, Timeout) when Role =:= client; Role =:= server ->
+    sync_send_event(Pid, {handshake, Role, Timeout}).
+
+handshake(Socket, Role, TunOptions, Timeout) ->
+    case filter_options(TunOptions) of
+        {[], Options} ->
+            {ok, TunSocket} = wrap(Socket, Options),
+            case handshake(TunSocket, Role, Timeout) of
+                ok ->
+                    {ok, TunSocket};
+                {error,_}=Err ->
+                    Err
+            end;
+        _ ->
+            {error, {badarg, TunOptions}}
+    end.
+
+wrap(#curve_tun_socket{} = Socket, _) ->
+    {ok, Socket};
+wrap(Socket, Options) when is_port(Socket) ->
+    ok = inet:setopts(Socket, [binary, {packet, 2}, {active, false}]),
+    {ok, Pid} = start_fsm(Socket, Options),
+    ok = gen_tcp:controlling_process(Socket, Pid),
+    {ok, #curve_tun_socket{ pid = Pid }}.
 
 send(#curve_tun_socket { pid = Pid }, Msg) ->
     sync_send_event(Pid, {send, Msg}).
@@ -153,59 +184,81 @@ metadata(#curve_tun_socket{ pid=Pid}) ->
     sync_send_event(Pid, metadata).
 
 %% @private
-start_fsm(Socket) ->
+start_fsm(Socket, Options) ->
     Controller = self(),
-    curve_tun_connection_sup:start_child([Controller, Socket]).
+    curve_tun_connection_sup:start_child([Controller, Socket, Options]).
 
 %% @private
-start_link(Controller, Socket) ->
-    gen_fsm:start_link(?MODULE, [Controller, Socket], []).
+start_link(Controller, Socket, Options) ->
+    gen_fsm:start_link(?MODULE, [Controller, Socket, Options], []).
 
 %% @private
-init([Controller,Socket]) ->
+init([Controller,Socket,Options]) ->
     Ref = erlang:monitor(process, Controller),
     State = #{
-        vault => curve_tun_vault_dummy,
-        registry => curve_tun_simple_registry,
-        controller => {Controller, Ref},
-        socket => Socket,
-        metadata => []
+      vault      => curve_tun_vault_dummy,
+      registry   => curve_tun_simple_registry,
+      controller => {Controller, Ref},
+      socket     => Socket,
+      restbin    => <<>>,
+
+      c          => 0,
+      rc         => 0,
+
+      packet => 0,
+      metadata => [],
+      active => false
     },
-    {ok, ready, State}.
+
+    %% apply options
+    State2 = lists:foldl(fun({K,V}, S) ->
+                                 maps:put(K,V,S);
+                            (Side, S) when Side =:= client; Side =:= server ->
+                                 maps:put(side,Side,S);
+                            (K, S) when is_atom(K) ->
+                                 maps:put(K, true, S)
+                         end,
+                         State,
+                         Options),
+
+    {ok, ready, State2}.
 
 
 %% @private
-ready({set_options, Options}, From, State) ->
-    gen_fsm:reply(From, ok),
-    State2 = lists:foldl(fun({K,V}, S) ->
-                                 maps:put(K,V,S)
-                         end,
-                         State,
-                         maps:to_list(Options)),
-    {next_state, ready, State2};
-ready({handshake, #{ mode := client, metadata := MD, peer_public_key := S, abs_timeout := AbsTimeout }}, From, #{socket := Socket }=State) ->
-    Timer = start_timer(unabs_timeout(AbsTimeout), handshake),
+ready({handshake, client, Timeout},
+      From,
+      #{ socket := Socket, peer_public_key := S }=State) ->
+    Timer = start_timer(Timeout, handshake),
     #{ public := EC, secret := ECs } = enacl:box_keypair(),
     case gen_tcp:send(Socket, e_hello(S, EC, ECs, 0)) of
         ok ->
             ok = inet:setopts(Socket, [{active, once}]),
-            {next_state, awaiting_cookie, State#{
-                                            peer_lt_public_key => S,
-                                            public_key => EC,
-                                            secret_key => ECs,
-                                            socket => Socket,
+            {next_state, awaiting_cookie, State#{ %
+                                            ephemeral_public_key => EC,
+                                            ephemeral_secret_key => ECs,
+                                            side => client,
                                             from => From,
-                                            timer => Timer,
-                                            md => MD }};
+                                            timer => Timer }};
         {error, Reason} ->
             {stop, normal, reply({error, Reason}, State)}
     end;
-ready({handshake, Opts=#{ mode := server, abs_timeout := AbsTimeout }}, From, 
- #{ socket := Socket } = State) ->
-    Timer = start_timer(unabs_timeout(AbsTimeout), handshake),
+ready({handshake, client, Timeout},
+      From, #{ socket := Socket }=State) ->
+    Timer = start_timer(Timeout, handshake),
+    case gen_tcp:send(Socket, e_tell()) of
+        ok ->
+            ok = inet:setopts(Socket, [{active, once}]),
+            {next_state, awaiting_welcome, State#{
+                                            side => client,
+                                            from => From,
+                                            timer => Timer }};
+        {error, Reason} ->
+            {stop, normal, reply({error, Reason}, State)}
+    end;
+ready({handshake, server, Timeout }, From, #{ socket := Socket } = State) ->
+    Timer = start_timer(Timeout, handshake),
     ok = inet:setopts(Socket, [{active, once}]),
-    {next_state, awaiting_hello, State#{ socket => Socket,
-                                         md => case maps:find(metadata, Opts) of {ok, MD} -> MD; error -> [] end,
+    {next_state, awaiting_hello, State#{ side => server,
                                          from => From,
                                          timer => Timer }}.
 
@@ -230,9 +283,8 @@ connected(_M, State) ->
 connected({recv, Timeout}, From, #{ recv_queue := Q } = State) ->
     Timer = start_timer(Timeout, {sync_recv, From}),
     process_recv_queue(State#{ recv_queue := queue:in(#{ type=>sync_recv, from => From, timer => Timer}, Q) });
-connected({send, M}, _From, #{ socket := Socket, secret_key := Ks, peer_public_key := P, c := NonceCount, side := Side } = State) ->
-    Len = byte_size(M),
-    case gen_tcp:send(Socket, e_msg(<<Len:16, M/binary>>, Side, NonceCount, P, Ks)) of
+connected({send, M}, _From, #{ socket := Socket, ephemeral_secret_key := Ks, peer_ephemeral_public_key := P, c := NonceCount, side := Side, packet := Packet } = State) ->
+    case gen_tcp:send(Socket, e_msg(encode_packet(Packet, M), Side, NonceCount, P, Ks)) of
          ok -> {reply, ok, connected, State#{ c := NonceCount + 1}};
          {error, _Reason} = Err -> {reply, Err, connected, State}
     end;
@@ -242,7 +294,10 @@ connected(peername, _From, #{socket := Socket} = State) ->
     {reply, inet:peername(Socket), connected, State};
 connected({setopts, Opts}, From, #{socket := Socket} = State) ->
     case lists:foldl(fun(_, E={_, _}) -> E;
-                        ({packet, 2}, S) -> S;
+                        ({packet, N}, S) when N == 0; N == 1; N == 2; N == 4 ->
+                             S#{ packet => N };
+                        ({packet, raw}, S) ->
+                             S#{ packet => 0 };
                         (binary, S) -> S;
                         (O={nodelay, _}, S) ->
                              case inet:setopts(Socket, [O]) of
@@ -281,6 +336,9 @@ handle_sync_event(peername, From, Statename, #{ socket := Socket }=State) ->
     {next_state, Statename, State};
 handle_sync_event(peer_public_key, From, Statename, #{ peer_public_key := Key }=State) ->
     gen_fsm:reply(From, {ok, Key}),
+    {next_state, Statename, State};
+handle_sync_event(peer_public_key, From, Statename, State) ->
+    gen_fsm:reply(From, undefined),
     {next_state, Statename, State};
 handle_sync_event(Event, _From, Statename, State) ->
     error_logger:info_msg("Unknown sync_event ~p in state ~p", [Event, Statename]),
@@ -404,41 +462,48 @@ process_recv_queue(#{ recv_queue := Q, buf := Buf, socket := Sock, controller :=
 
 handle_msg(?COUNT_LIMIT, _Box, _State) -> exit(count_limit);
 handle_msg(N, Box, #{
-	peer_public_key := P,
-	secret_key := Ks,
-	buf := undefined,
-	side := Side,
-	rc := N } = State) ->
+                peer_ephemeral_public_key := P,
+                ephemeral_secret_key := Ks,
+                buf := undefined,
+                side := Side,
+                rc := N,
+                packet := Packet,
+                restbin := Old } = State) ->
     Nonce = case Side of
                 client -> st_nonce(msg, server, N);
                 server -> st_nonce(msg, client, N)
             end,
-    {ok, <<Len:16, Msg:Len/binary>>} = enacl:box_open(Box, Nonce, P, Ks),
-    process_recv_queue(State#{ buf := Msg, rc := N+1 }).
+    {ok, Payload} = enacl:box_open(Box, Nonce, P, Ks),
+    case erlang:decode_packet(Packet, All = <<Old/binary, Payload/binary>>, []) of
+        {ok, Msg, Rest} ->
+            process_recv_queue(State#{ buf := Msg, restbin := Rest, rc := N+1 });
+        {more, _} ->
+            process_recv_queue(State#{ restbin := All, rc := N+1 });
+        {error, Reason} ->
+            {stop, {error, Reason}, State}
+    end.
 
-handle_vouch(K, 1, Box, #{ socket := Sock, vault := Vault, registry := Registry, md := MDOut } = State) ->
+handle_vouch(_, N, _, #{ rc := RC } = State) when N < RC ->
+    {stop, {bad_nonce, N}, State};
+handle_vouch(K, N, Box, #{ c := C, socket := Sock, vault := Vault, registry := Registry, metadata := MDOut } = State) ->
     case unpack_cookie(K) of
         {ok, EC, ESs} ->
-            Nonce = st_nonce(initiate, client, 1),
-            {ok, <<C:32/binary, NonceLT:16/binary, Vouch:48/binary, MetaData/binary>>} = enacl:box_open(Box, Nonce, EC, ESs),
-            true = Registry:verify(Sock, C),
+            Nonce = st_nonce(initiate, client, N),
+            {ok, <<ClientPK:32/binary, NonceLT:16/binary, Vouch:48/binary, MetaData/binary>>} = enacl:box_open(Box, Nonce, EC, ESs),
+            true = Registry:verify(Sock, ClientPK),
             VNonce = lt_nonce(client, NonceLT),
-            {ok, <<EC:32/binary>>} = Vault:box_open(Vouch, VNonce, C),
+            {ok, <<EC:32/binary>>} = Vault:box_open(Vouch, VNonce, ClientPK),
 
             case MetaData of
                 <<>> -> % client didn't send meta data
                     %% Everything seems to be in order, go to connected state
-                    NState = State#{ recv_queue => queue:new(), buf => undefined, rmd => [],
-                                     secret_key => ESs, peer_public_key => EC, c => 3, rc => 2, side => server, active => false },
-                    process_recv_queue(reply(ok, NState));
+                    begin_connected(ClientPK, ESs, EC, [], C, N+1, State);
                 _ ->
                     MDIn = d_metadata(MetaData),
-                    case gen_tcp:send(Sock, e_ready(MDOut, 2, EC, ESs)) of
+                    case gen_tcp:send(Sock, e_ready(MDOut, C, EC, ESs)) of
                         ok ->
                             %% Everything seems to be in order, go to connected state
-                            NState = State#{ recv_queue => queue:new(), buf => undefined, rmd => MDIn,
-                                             secret_key => ESs, peer_public_key => EC, c => 3, rc => 2, side => server, active => false },
-                            process_recv_queue(reply(ok, NState));
+                            begin_connected(ClientPK, ESs, EC, MDIn, C+1, N+1, State);
                         {error, _Reason} = Err ->
                             {stop, Err, State}
                     end
@@ -449,14 +514,29 @@ handle_vouch(K, 1, Box, #{ socket := Sock, vault := Vault, registry := Registry,
 
     end.
 
-handle_cookie(N, Box, #{ public_key := EC, secret_key := ECs, peer_lt_public_key := S, socket := Socket, vault := Vault, md := MD } = State) ->
+begin_connected(ClientPK, ESs, EC, MDIn, C, RC, State) ->
+    NState = State#{
+               recv_queue => queue:new(),
+               buf => undefined,
+               rmd => MDIn,
+               ephemeral_secret_key => ESs,
+               peer_public_key => ClientPK,
+               peer_ephemeral_public_key => EC,
+               c => C,
+               rc => RC,
+               side => server,
+               active => false },
+    process_recv_queue(reply(ok, NState)).
+
+
+handle_cookie(N, Box, #{ ephemeral_public_key := EC, ephemeral_secret_key := ECs, peer_public_key := S, socket := Socket, vault := Vault, md := MD } = State) ->
     Nonce = lt_nonce(server, N),
     {ok, <<ES:32/binary, K/binary>>} = enacl:box_open(Box, Nonce, S, ECs),
     case gen_tcp:send(Socket, e_vouch(K, EC, S, Vault, 1, ES, ECs, MD)) of
         ok ->
             ok = inet:setopts(Socket, [{active, once}]),
             {next_state, awaiting_ready, State#{
-			peer_public_key => ES,
+			peer_ephemeral_public_key => ES,
 			recv_queue => queue:new(),
 			buf => undefined,
 			c => 2,
@@ -466,12 +546,14 @@ handle_cookie(N, Box, #{ public_key := EC, secret_key := ECs, peer_lt_public_key
             {stop, normal, reply(Err, State)}
     end.
 
+handle_ready(N, _, State = #{ rc := N2 }) when N < N2 ->
+    {stop, bad_nonce, State};
 handle_ready(N, Box, State = #{
-                       secret_key := Ks,
-                       peer_public_key := P,
-                       rc := N,
+                       ephemeral_secret_key := Ks,
+                       peer_ephemeral_public_key := P,
+                       rc := N2,
                        side := client,
-                       socket := Sock }) ->
+                       socket := Sock }) when N >= N2 ->
     Nonce = st_nonce(ready, server, N),
     {ok, MetaData} = enacl:box_open(Box, Nonce, P, Ks),
     ServersMD = d_metadata(MetaData),
@@ -479,7 +561,7 @@ handle_ready(N, Box, State = #{
     ok = inet:setopts(Sock, [{active, once}]),
     {next_state, connected, reply(ok, State#{ rc := N+1, rmd => ServersMD })}.
 
-handle_hello(EC, Box, #{ vault := Vault, socket := Socket } = State) ->
+handle_hello(EC, Box, #{ vault := Vault, socket := Socket, side := server } = State) ->
 
     STNonce = st_nonce(hello, client, 0),
     {ok, <<0:512/integer>>} = Vault:box_open(Box, STNonce, EC),
@@ -494,6 +576,30 @@ handle_hello(EC, Box, #{ vault := Vault, socket := Socket } = State) ->
             {stop, normal, {error, Reason}, State}
     end.
 
+handle_tell(#{ socket := Socket, side := server, vault := Vault } = State) ->
+    PK = Vault:public_key(),
+    case gen_tcp:send(Socket, e_welcome(PK)) of
+        ok ->
+            ok = inet:setopts(Socket, [{active, once}]),
+            {next_state, awaiting_hello, State};
+        {error, Reason} ->
+            {stop, normal, {error, Reason}, State}
+    end.
+
+handle_welcome(S, #{ socket := Socket, side := client } = State) ->
+    #{ public := EC, secret := ECs } = enacl:box_keypair(),
+    case gen_tcp:send(Socket, e_hello(S, EC, ECs, 0)) of
+        ok ->
+            ok = inet:setopts(Socket, [{active, once}]),
+            {next_state, awaiting_cookie, State#{
+                                            ephemeral_public_key => EC,
+                                            ephemeral_secret_key => ECs,
+                                            c => 1,
+                                            rc => 0
+                                           }};
+        {error, Reason} ->
+            {stop, normal, reply({error, Reason}, State)}
+    end.
 
 handle_tcp(Data, StateName, State) ->
     case {d_packet(Data), StateName} of
@@ -501,7 +607,9 @@ handle_tcp(Data, StateName, State) ->
         {{vouch, K, N, Box}, awaiting_vouch} -> handle_vouch(K, N, Box, State);
         {{cookie, N, Box}, awaiting_cookie} -> handle_cookie(N, Box, State);
         {{ready, N, Box}, awaiting_ready} -> handle_ready(N, Box, State);
-        {{hello, EC, 0, Box}, awaiting_hello} -> handle_hello(EC, Box, State)
+        {{hello, EC, 0, Box}, awaiting_hello} -> handle_hello(EC, Box, State);
+        {{welcome, S}, awaiting_welcome} -> handle_welcome(S, State);
+        {tell, awaiting_hello} -> handle_tell(State)
     end.
 
 
@@ -528,6 +636,12 @@ lt_nonce(server, N) -> <<"CurveCPK", N/binary>>.
 %% for easy perusal. Note that while the arguments are terse, they do have
 %% meaning since they reflect the meaning of the protocol specification. For
 %% instance, the argument ECs means (E)phermeral (C)lient (s)ecret key.
+e_tell() ->
+    <<?TELL_TAG>>.
+
+e_welcome(PK) ->
+    <<?WELCOME_TAG, PK/binary>>.
+
 e_hello(S, EC, ECs, N) ->
     Nonce = st_nonce(hello, client, N),
     Box = enacl:box(binary:copy(<<0>>, 64), Nonce, S, ECs),
@@ -618,24 +732,21 @@ e_metadata([{Key,Value}|Rest], Data)
 %% Handle options.  This splits options into socket options and curve_tun options.
 
 filter_options(List) ->
-    filter_options(List, [], #{ metadata=>[], timeout => infinity, mode => client, active => false }).
+    Curve = lists:filter(fun is_curve_option/1, List),
+    Tcp   = lists:filter(fun is_tcp_option/1, List),
+    {Tcp, Curve}.
 
-filter_options([], SO, CTO) ->
-    {lists:reverse(SO), CTO};
-filter_options([KV={K,V}|Rest], SocketOpts, CurveOpts) ->
-    case lists:member(K, [metadata, peer_public_key, timeout, mode, active]) of
-        true ->
-            filter_options(Rest, SocketOpts, maps:put(K,V,CurveOpts));
-        false ->
-            filter_options(Rest, [KV|SocketOpts], CurveOpts)
-    end;
-filter_options([K|Rest], SocketOpts, CurveOpts) ->
-    case lists:member(K, [server, client]) of
-        true ->
-            filter_options(Rest, SocketOpts, maps:put(mode,K,CurveOpts));
-        false ->
-            filter_options(Rest, [K|SocketOpts], CurveOpts)
+is_tcp_option(Opt) ->
+    not is_curve_option(Opt).
+
+is_curve_option(Opt) ->
+    case Opt of
+        {K,_} ->
+            lists:member(K, [active, metadata, packet, peer_public_key, key]);
+        _ ->
+            false
     end.
+
 
 %% UTILITY
 
@@ -675,15 +786,19 @@ cancel_timer(Timer) ->
     erlang:cancel_timer(Timer),
     ok.
 
-abs_timeout(infinity) ->
-    infinity;
-abs_timeout(Millis) when Millis > 0 ->
-    now_ms(erlang:now()) + Millis.
+encode_packet(0, Bin) when is_binary(Bin) ->
+    Bin;
+encode_packet(1, Bin) when byte_size(Bin) < 16#FF ->
+    Len = byte_size(Bin),
+    <<Len:8, Bin/binary>>;
+encode_packet(2, Bin) when byte_size(Bin) < 16#FFFF->
+    Len = byte_size(Bin),
+    <<Len:16, Bin/binary>>;
+encode_packet(4, Bin) when byte_size(Bin) < 16#FFFFFFFF ->
+    Len = byte_size(Bin),
+    <<Len:32, Bin/binary>>.
 
-unabs_timeout(infinity) ->
+millis_left(_BeforeTime, infinity) ->
     infinity;
-unabs_timeout(Absolute) ->
-    max(0, Absolute - now_ms(erlang:now())).
-
-now_ms({MegaSecs,Secs,MicroSecs}) ->
-    (MegaSecs*1000000 + Secs)*1000 + (MicroSecs div 1000).
+millis_left(BeforeTime, Timeout) ->
+    max(0, Timeout - (timer:now_diff(erlang:now(), BeforeTime) div 1000)).

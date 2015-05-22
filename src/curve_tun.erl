@@ -1,6 +1,6 @@
 -module(curve_tun).
 
--export([connect/3, transport_accept/1, handshake/2, accept/1, accept/2, listen/2, start/2, send/2, close/1, recv/1, recv/2, async_recv/1, async_recv/2, controlling_process/2, metadata/1,          peername/1, setopts/2, peer_public_key/1
+-export([connect/3, transport_accept/1, handshake/3, accept/1, accept/2, listen/2, start/2, send/2, close/1, recv/1, recv/2, async_recv/1, async_recv/2, controlling_process/2, metadata/1,          peername/1, setopts/2, peer_public_key/1
 ]).
 
 start(Socket, Opts) ->
@@ -13,10 +13,10 @@ accept(LSock) ->
     curve_tun_connection:accept(LSock).
 
 transport_accept(LSock) ->
-    curve_tun_connection:transport_accept(LSock).
+    curve_tun_connection:transport_accept(LSock, infinity).
 
-handshake(Sock, Options) ->
-    curve_tun_connection:handshake(Sock, Options).
+handshake(Sock, Role, Timeout) when Role =:= client; Role =:= server ->
+    curve_tun_connection:handshake(Sock, Role, Timeout).
 
 accept(LSock, Timeout) ->
     curve_tun_connection:accept(LSock, Timeout).
