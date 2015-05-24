@@ -3,7 +3,7 @@
 
 -export([connect/3, connect/4, transport_accept/2, handshake/3, handshake/4, accept/1, accept/2, listen/2, send/2, close/1,
          recv/1, recv/2, controlling_process/2,
-         metadata/1, 
+         metadata/1,
          peername/1, setopts/2, peer_public_key/1
         ]).
 
@@ -20,9 +20,7 @@
 	ready/2, ready/3
 ]).
 
--record(curve_tun_lsock, { lsock :: port (), options :: list() }).
-
--record(curve_tun_socket, { pid :: pid() }).
+-include("curve_tun_api.hrl").
 
 %% Maximal number of messages that can be sent on the line before we crash.
 %% I don't expect code to ever hit this limit. As an example, you exhaust this in
@@ -45,11 +43,12 @@
 %% tries to mimick the behavior of public methods for ssl
 %%
 
-connect(Address, Port, Options) when is_list(Options) ->
-    connect(Address, Port, Options, infinity);
-
-connect(Port, Options, Timeout) when is_port(Port) ->
+connect(Port, Options, Timeout)
+  when is_port(Port),
+       is_list(Options),
+       ((Timeout =:= infinity) orelse is_integer(Timeout)) ->
     { TcpOpts, TunOptions } = filter_options(Options),
+    ok = gen_tcp:setopts(Port, TcpOpts),
     connect2(Port, TcpOpts, TunOptions, Timeout).
 
 connect(Address, Port, Options, Timeout) ->
@@ -110,6 +109,7 @@ accept(LSock=#curve_tun_lsock{}, Timeout) ->
             Err
     end;
 accept(LSock, Timeout) when is_port(LSock) ->
+    ok = gen_tcp:setopts(LSock, [{active, false}, binary, {packet, 2}]),
     accept(#curve_tun_lsock{ lsock=LSock, options = [] }, Timeout).
 
 accept(LSock) ->
@@ -389,7 +389,8 @@ code_change(_OldVsn, Statename, State, _Aux) ->
 handle_unrecv_data(#{ recv_queue := Q, controller := {Controller,_}, active := Active } = State) ->
 
     %% reply {error, closed} to all sync callers
-    [ gen_fsm:reply(Receiver, {error, closed}) || #{ type := sync_recv, from := Receiver } <- queue:to_list(Q) ],
+    [ gen_fsm:reply(Receiver, {error, closed})
+      || #{ type := sync_recv, from := Receiver } <- queue:to_list(Q) ],
 
     case Active of
         false ->

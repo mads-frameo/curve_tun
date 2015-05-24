@@ -1,35 +1,71 @@
 -module(curve_tun).
 
--export([connect/3, transport_accept/1, handshake/3, accept/1, accept/2, listen/2, start/2, send/2, close/1, recv/1, recv/2, async_recv/1, async_recv/2, controlling_process/2, metadata/1,          peername/1, setopts/2, peer_public_key/1
+-export([
+         connect/2, connect/3, connect/4,
+         listen/2,
+         transport_accept/1, handshake/3, accept/1, accept/2, send/2, close/1, recv/1, recv/2, async_recv/1, async_recv/2, controlling_process/2, metadata/1,          peername/1, setopts/2, peer_public_key/1
 ]).
 
-start(Socket, Opts) ->
-    curve_tun_connection:start(Socket, Opts).
+-include("curve_tun_api.hrl").
 
-connect(Host, Port, Opts) ->
-    curve_tun_connection:connect(Host, Port, Opts).
-    
-accept(LSock) ->
-    curve_tun_connection:accept(LSock).
+%% --------------------------------------------------
+
+-spec connect(host() | port(), [connect_option()]) -> {ok, #curve_tun_socket{}} |
+					      {error, reason()}.
+-spec connect(host() | port(), [connect_option()] | inet:port_number(),
+	      timeout() | list()) ->
+		     {ok, #curve_tun_socket{}} | {error, reason()}.
+-spec connect(host() | port(), inet:port_number(), list(), timeout()) ->
+		     {ok, #curve_tun_socket{}} | {error, reason()}.
+
+connect(Host, Opts) when is_list(Opts) ->
+    connect(Host, Opts, infinity).
+
+connect(Port, Opts, Timeout) when is_port(Port), is_list(Opts) ->
+    curve_tun_connection:connect(Port, Opts, Timeout);
+
+connect(Host, Port, Opts) when is_integer(Port), is_list(Opts) ->
+    connect(Host, Port, Opts, infinity).
+
+connect(Host, Port, Opts, Timeout) ->
+    curve_tun_connection:connect(Host, Port, Opts, Timeout).
+
+
+%% --------------------------------------------------
+
+-spec listen(inet:port_number(), [listen_option()]) ->
+    {ok, #curve_tun_socket{}} | {error, reason()}.
+
+listen(Port, Opts) ->
+    curve_tun_connection:listen(Port, Opts).
+
+%%--------------------------------------------------------------------
+-spec transport_accept(#curve_tun_lsock{}) -> {ok, #curve_tun_socket{}} |
+					{error, reason()}.
+-spec transport_accept(#curve_tun_lsock{}, timeout()) -> {ok, #curve_tun_socket{}} |
+						   {error, reason()}.
 
 transport_accept(LSock) ->
-    curve_tun_connection:transport_accept(LSock, infinity).
+    transport_accept(LSock, infinity).
+
+transport_accept(LSock, Timeout) ->
+    curve_tun_connection:transport_accept(LSock, Timeout).
 
 handshake(Sock, Role, Timeout) when Role =:= client; Role =:= server ->
     curve_tun_connection:handshake(Sock, Role, Timeout).
 
+accept(LSock) ->
+    curve_tun_connection:accept(LSock).
+
 accept(LSock, Timeout) ->
     curve_tun_connection:accept(LSock, Timeout).
-    
-listen(Port, Opts) ->
-    curve_tun_connection:listen(Port, Opts).
-    
+
 send(Sock, Msg) ->
     curve_tun_connection:send(Sock, Msg).
-    
+
 close(Sock) ->
     curve_tun_connection:close(Sock).
-    
+
 recv(Sock) ->
     curve_tun_connection:recv(Sock).
 
