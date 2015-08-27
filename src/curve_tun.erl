@@ -3,7 +3,10 @@
 -export([
          connect/2, connect/3, connect/4,
          listen/2,
-         transport_accept/1, handshake/3, accept/1, accept/2, send/2, close/1, recv/1, recv/2, async_recv/1, async_recv/2, controlling_process/2, metadata/1,          peername/1, setopts/2, peer_public_key/1
+         transport_accept/1,
+         handshake/3, handshake/4,
+         accept/1, accept/2,
+         send/2, close/1, recv/1, recv/2, async_recv/1, async_recv/2, controlling_process/2, metadata/1,          peername/1, setopts/2, peer_public_key/1
 ]).
 
 -include("curve_tun_api.hrl").
@@ -51,8 +54,24 @@ transport_accept(LSock) ->
 transport_accept(LSock, Timeout) ->
     curve_tun_connection:transport_accept(LSock, Timeout).
 
+%%--------------------------------------------------------------------
+
+-spec handshake(#curve_tun_socket{},
+                client | server,
+                timeout()) ->
+    ok | {error, reason()}.
+
 handshake(Sock, Role, Timeout) when Role =:= client; Role =:= server ->
     curve_tun_connection:handshake(Sock, Role, Timeout).
+
+-spec handshake(port(), client|server, [curve_tun_option()], timeout) ->
+    {ok, #curve_tun_socket{}} | {error, reason()}.
+handshake(Port, Role, Options, Timeout) when Role =:= client; Role =:= server ->
+    curve_tun_connection:handshake(Port, Role, Options, Timeout).
+
+
+%%--------------------------------------------------------------------
+%% does transport_accept + handshake(server).
 
 accept(LSock) ->
     curve_tun_connection:accept(LSock).

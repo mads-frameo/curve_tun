@@ -127,7 +127,10 @@ transport_accept(#curve_tun_lsock { lsock = LSock, options=TunOptions }, Timeout
 handshake(#curve_tun_socket{ pid = Pid }, Role, Timeout) when Role =:= client; Role =:= server ->
     sync_send_event(Pid, {handshake, Role, Timeout}).
 
-handshake(Socket, Role, TunOptions, Timeout) ->
+-spec handshake(port(), client|server, [curve_tun_option()], timeout) ->
+    {ok, #curve_tun_socket{}} | {error, reason()}.
+
+handshake(Socket, Role, TunOptions, Timeout) when is_port(Socket) ->
     case filter_options(TunOptions) of
         {[], Options} ->
             {ok, TunSocket} = wrap(Socket, Options),
@@ -213,8 +216,6 @@ init([Controller,Socket,Options]) ->
     %% apply options
     State2 = lists:foldl(fun({K,V}, S) ->
                                  maps:put(K,V,S);
-                            (Side, S) when Side =:= client; Side =:= server ->
-                                 maps:put(side,Side,S);
                             (K, S) when is_atom(K) ->
                                  maps:put(K, true, S)
                          end,
