@@ -744,7 +744,7 @@ is_tcp_option(Opt) ->
 is_curve_option(Opt) ->
     case Opt of
         {K,_} ->
-            lists:member(K, [active, metadata, packet, peer_public_key, key]);
+            lists:member(K, [active, metadata, packet, peer_public_key, key, vault]);
         _ ->
             false
     end.
