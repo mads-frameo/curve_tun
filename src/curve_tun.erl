@@ -6,7 +6,7 @@
          transport_accept/1,
          handshake/3, handshake/4,
          accept/1, accept/2,
-         send/2, close/1, recv/1, recv/2, async_recv/1, async_recv/2, controlling_process/2, metadata/1,          peername/1, setopts/2, peer_public_key/1
+         send/2, close/1, recv/1, recv/2, controlling_process/2, metadata/1,          peername/1, setopts/2, peer_public_key/1
 ]).
 
 -include("curve_tun_api.hrl").
@@ -106,8 +106,3 @@ metadata(Sock) ->
 setopts(Sock, Opts) ->
     curve_tun_connection:setopts(Sock, Opts).
 
-async_recv(Sock) ->
-    curve_tun_connection:async_recv(Sock, infinity).
-
-async_recv(Sock, Timeout) ->
-    curve_tun_connection:async_recv(Sock, Timeout).
