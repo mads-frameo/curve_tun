@@ -23,11 +23,12 @@ end_per_group(_Group, _Config) ->
     ok.
 
 init_per_suite(Config) ->
-    error_logger:tty(false), %% Disable the error loggers tty output for tests
+    %% error_logger:tty(false), %% Disable the error loggers tty output for tests
+    %%application:ensure_all_started(sasl),
     {ok, Apps} = application:ensure_all_started(curve_tun),
     PK = <<81,13,101,52,29,109,136,196,86,91,34,91,3,19,150,3,215,
     		43,210,9,242,146,119,188,153,245,78,232,94,113,37,47>>,
-    [{apps, Apps}, {host, "localhost"}, {port, 1337}, {receiver_pk, PK}| Config].
+    [{apps, Apps}, {host, "127.0.0.1"}, {port, 1337}, {receiver_pk, PK}| Config].
 
 end_per_suite(Config) ->
     Apps = proplists:get_value(apps, Config),
@@ -51,8 +52,11 @@ all() ->
     [{group, basic}].
 
 send_recv(Config) ->
-    SPid = sender(Config),
     RPid = receiver(Config),
+    SPid = sender(Config),
+
+    error_logger:info_msg("sender=~p, receiver=~p, self=~p", [SPid, RPid, self()]),
+
     ok = join([RPid, SPid]),
     ok.
 
@@ -66,18 +70,22 @@ join([P | Next]) ->
         {P, ok} ->
             demonitor(MRef, [flush]), join(Next);
         {P, {error, Err}} -> ct:fail(Err)
-   after ?TIMEOUT ->
+
+after ?TIMEOUT ->
        ct:fail(timeout)
    end.
    
 sender(Config) ->
     Ctl = self(),
-    spawn(fun() ->
+    proc_lib:spawn_link(fun() ->
         random:seed(erlang:now()),
         ct:sleep(10),
         sleep(),
-        {ok, Sock} = curve_tun:connect(?config(host, Config), ?config(port, Config),
-            [{peer_public_key, ?config(receiver_pk, Config)}, {metadata, [{<<"a">>, <<"A">>}]}, {timeout, 3000}]),
+        {ok, Sock} = curve_tun:connect(
+            ?config(host, Config),
+            ?config(port, Config),
+            [{peer_public_key, ?config(receiver_pk, Config)}, {metadata, [{<<"a">>, <<"A">>}]}],
+            3000),
         sleep(),
         {ok, [{<<"b">>, <<"B">>}]} = curve_tun:metadata(Sock),
         sleep(),
@@ -86,21 +94,12 @@ sender(Config) ->
         ok = curve_tun:send(Sock, <<"2">>),
         sleep(),
 
-        {ok, _Ref1} = curve_tun:async_recv(Sock, random:uniform(100)-1),
-        receive
-            {curve_tun, Sock, _Msg1} -> exit({unexpected_msg, _Msg1});
-            {curve_tun_async_timeout, Sock, _Ref1} -> ok
-        after 120 ->
-                exit(async_took_too_long)
-        end,
-        sleep(),
-
-        {ok, _} = curve_tun:async_recv(Sock),
+        curve_tun:setopts(Sock, [{active, once}]),
         receive
             {curve_tun, Sock, _Msg2} -> exit({unexpected_msg, _Msg2});
-            {curve_tun_async_timeout, Sock, _} -> exit(unexpected_async_timeout)
+            {curve_tun_closed, Sock} -> exit(unexpected_close)
         after random:uniform(100) ->
-            ok
+            curve_tun:setopts(Sock, [{active, false}])
         end,
         sleep(),
 
@@ -112,7 +111,7 @@ sender(Config) ->
     
 receiver(Config) ->
     Ctl = self(),
-    spawn(fun() ->
+    proc_lib:spawn_link(fun() ->
         random:seed(erlang:now()),
         ok = curve_tun_simple_registry:register({127,0,0,1},<<81,13,101,52,29,109,136,196,86,91,34,91,3,19,150,3,215, 43,210,9,242,146,119,188,153,245,78,232,94,113,37,47>>),
         {ok, LSock} = curve_tun:listen(?config(port, Config), [{reuseaddr, true}, {metadata, [{<<"b">>, <<"B">>}]}]),
@@ -125,7 +124,7 @@ receiver(Config) ->
         sleep(),
         {ok, <<"2">>} = curve_tun:recv(Sock),
         sleep(),
-        curve_tun:async_recv(Sock),
+        curve_tun:setopts(Sock, [{active, once}]),
         receive
             {curve_tun, Sock, <<"3">>} -> ok
         end,

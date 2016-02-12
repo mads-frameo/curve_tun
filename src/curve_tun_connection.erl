@@ -48,13 +48,13 @@ connect(Port, Options, Timeout)
        is_list(Options),
        ((Timeout =:= infinity) orelse is_integer(Timeout)) ->
     { TcpOpts, TunOptions } = filter_options(Options),
-    ok = gen_tcp:setopts(Port, TcpOpts),
+    ok = inet:setopts(Port, TcpOpts),
     connect2(Port, TcpOpts, TunOptions, Timeout).
 
 connect(Address, Port, Options, Timeout) ->
     { TcpOpts, TunOptions } = filter_options(Options),
-    BeforeTime = erlang:now(),
-    case gen_tcp:connect(Address, Port, [{active, false} | TcpOpts ], Timeout) of
+    BeforeTime = os:timestamp(),
+    case gen_tcp:connect(Address, Port, [binary, {packet, 2}, {active, false} | TcpOpts ], Timeout) of
         {ok, Socket} ->
             case millis_left(BeforeTime, Timeout) of
                 0 ->
@@ -68,7 +68,7 @@ connect(Address, Port, Options, Timeout) ->
     end.
 
 connect2(Port, TcpOpts, TunOpts, Timeout) when is_port(Port) ->
-    ok = gen_tcp:setopts( Port, TcpOpts ),
+    ok = inet:setopts( Port, TcpOpts ),
     {ok, Pid} = start_fsm( Port, TunOpts ),
     ok = gen_tcp:controlling_process( Port, Pid ),
     Socket = #curve_tun_socket{ pid = Pid },
@@ -90,7 +90,7 @@ listen(Port, Opts) when is_list(Opts) ->
     end.
 
 accept(LSock=#curve_tun_lsock{}, Timeout) ->
-    BeforeTime = erlang:now(),
+    BeforeTime = os:timestamp(),
     case transport_accept( LSock, Timeout ) of
         {ok, Socket} ->
             case millis_left(BeforeTime, Timeout) of
@@ -109,7 +109,7 @@ accept(LSock=#curve_tun_lsock{}, Timeout) ->
             Err
     end;
 accept(LSock, Timeout) when is_port(LSock) ->
-    ok = gen_tcp:setopts(LSock, [{active, false}, binary, {packet, 2}]),
+    ok = inet:setopts(LSock, [{active, false}, binary, {packet, 2}]),
     accept(#curve_tun_lsock{ lsock=LSock, options = [] }, Timeout).
 
 accept(LSock) ->
@@ -193,10 +193,13 @@ start_fsm(Socket, Options) ->
 
 %% @private
 start_link(Controller, Socket, Options) ->
-    gen_fsm:start_link(?MODULE, [Controller, Socket, Options], []).
+    gen_fsm:start_link(?MODULE, [Controller, Socket, Options], []). %% {debug, [trace,log]}
 
 %% @private
 init([Controller,Socket,Options]) ->
+
+    %% error_logger:info_msg("connection pid=~p", [self()]),
+
     Ref = erlang:monitor(process, Controller),
     State = #{
       vault      => curve_tun_vault_dummy,
@@ -206,7 +209,7 @@ init([Controller,Socket,Options]) ->
       restbin    => <<>>,
 
       c          => 0,
-      rc         => 0,
+      rc         => -1,
 
       packet => 0,
       metadata => [],
@@ -228,10 +231,10 @@ init([Controller,Socket,Options]) ->
 %% @private
 ready({handshake, client, Timeout},
       From,
-      #{ socket := Socket, peer_public_key := S }=State) ->
+      #{ socket := Socket, peer_public_key := S, c := C }=State) ->
     Timer = start_timer(Timeout, handshake),
     #{ public := EC, secret := ECs } = enacl:box_keypair(),
-    case gen_tcp:send(Socket, e_hello(S, EC, ECs, 0)) of
+    case gen_tcp:send(Socket, e_hello(S, EC, ECs, C)) of
         ok ->
             ok = inet:setopts(Socket, [{active, once}]),
             {next_state, awaiting_cookie, State#{ %
@@ -239,7 +242,9 @@ ready({handshake, client, Timeout},
                                             ephemeral_secret_key => ECs,
                                             side => client,
                                             from => From,
-                                            timer => Timer }};
+                                            timer => Timer,
+                                            c := C+1
+                }};
         {error, Reason} ->
             {stop, normal, reply({error, Reason}, State)}
     end;
@@ -368,11 +373,13 @@ handle_info({timer, {sync_recv, From}}, Statename, #{ recv_queue := Q } = State)
                                        queue:to_list(Q))),
     {next_state, Statename, State#{ recv_queue => NewQ }};
 handle_info(Info, Statename, State) ->
-    error_logger:info_msg("Unknown info msg ~p in state ~p", [Info, Statename]),
+    error_logger:info_msg("Unknown info msg ~p in state ~p with state: ~p", [Info, Statename, State]),
     {next_state, Statename, State}.
 
 
 terminate(_Reason, _Statename, State) ->
+
+
 
     case maps:find(socket, State) of
         {ok, Sock} -> gen_tcp:close(Sock);
@@ -463,12 +470,13 @@ process_recv_queue(#{ recv_queue := Q, buf := Buf, socket := Sock, controller :=
     end.
 
 handle_msg(?COUNT_LIMIT, _Box, _State) -> exit(count_limit);
+handle_msg(N, _, #{ rc := RC } = State) when N < RC ->
+    {stop, {bad_nonce, N}, State};
 handle_msg(N, Box, #{
                 peer_ephemeral_public_key := P,
                 ephemeral_secret_key := Ks,
                 buf := undefined,
                 side := Side,
-                rc := N,
                 packet := Packet,
                 restbin := Old } = State) ->
     Nonce = case Side of
@@ -478,9 +486,9 @@ handle_msg(N, Box, #{
     {ok, Payload} = enacl:box_open(Box, Nonce, P, Ks),
     case erlang:decode_packet(Packet, All = <<Old/binary, Payload/binary>>, []) of
         {ok, Msg, Rest} ->
-            process_recv_queue(State#{ buf := Msg, restbin := Rest, rc := N+1 });
+            process_recv_queue(State#{ buf := Msg, restbin := Rest, rc := N });
         {more, _} ->
-            process_recv_queue(State#{ restbin := All, rc := N+1 });
+            process_recv_queue(State#{ restbin := All, rc := N });
         {error, Reason} ->
             {stop, {error, Reason}, State}
     end.
@@ -499,13 +507,13 @@ handle_vouch(K, N, Box, #{ c := C, socket := Sock, vault := Vault, registry := R
             case MetaData of
                 <<>> -> % client didn't send meta data
                     %% Everything seems to be in order, go to connected state
-                    begin_connected(ClientPK, ESs, EC, [], C, N+1, State);
+                    begin_connected(ClientPK, ESs, EC, [], C, N, State);
                 _ ->
                     MDIn = d_metadata(MetaData),
                     case gen_tcp:send(Sock, e_ready(MDOut, C, EC, ESs)) of
                         ok ->
                             %% Everything seems to be in order, go to connected state
-                            begin_connected(ClientPK, ESs, EC, MDIn, C+1, N+1, State);
+                            begin_connected(ClientPK, ESs, EC, MDIn, C+1, N, State);
                         {error, _Reason} = Err ->
                             {stop, Err, State}
                     end
@@ -531,19 +539,18 @@ begin_connected(ClientPK, ESs, EC, MDIn, C, RC, State) ->
     process_recv_queue(reply(ok, NState)).
 
 
-handle_cookie(N, Box, #{ ephemeral_public_key := EC, ephemeral_secret_key := ECs, peer_public_key := S, socket := Socket, vault := Vault, md := MD } = State) ->
+handle_cookie(N, Box, #{ ephemeral_public_key := EC, ephemeral_secret_key := ECs, peer_public_key := S, socket := Socket, vault := Vault, metadata := MD, c := C } = State) ->
     Nonce = lt_nonce(server, N),
     {ok, <<ES:32/binary, K/binary>>} = enacl:box_open(Box, Nonce, S, ECs),
-    case gen_tcp:send(Socket, e_vouch(K, EC, S, Vault, 1, ES, ECs, MD)) of
+    case gen_tcp:send(Socket, e_vouch(K, EC, S, Vault, C, ES, ECs, MD)) of
         ok ->
             ok = inet:setopts(Socket, [{active, once}]),
             {next_state, awaiting_ready, State#{
 			peer_ephemeral_public_key => ES,
 			recv_queue => queue:new(),
 			buf => undefined,
-			c => 2,
-			side => client,
-			rc => 2 }};
+			c => C+1,
+			side => client }};
         {error, _Reason} = Err ->
             {stop, normal, reply(Err, State)}
     end.
@@ -553,19 +560,20 @@ handle_ready(N, _, State = #{ rc := N2 }) when N < N2 ->
 handle_ready(N, Box, State = #{
                        ephemeral_secret_key := Ks,
                        peer_ephemeral_public_key := P,
-                       rc := N2,
                        side := client,
-                       socket := Sock }) when N >= N2 ->
+                       socket := Sock }) ->
     Nonce = st_nonce(ready, server, N),
     {ok, MetaData} = enacl:box_open(Box, Nonce, P, Ks),
     ServersMD = d_metadata(MetaData),
     %% deal with server's MD
     ok = inet:setopts(Sock, [{active, once}]),
-    {next_state, connected, reply(ok, State#{ rc := N+1, rmd => ServersMD })}.
+    {next_state, connected, reply(ok, State#{ rc := N, rmd => ServersMD })}.
 
-handle_hello(EC, Box, #{ vault := Vault, socket := Socket, side := server } = State) ->
+handle_hello(N, _, _, State = #{ rc := N2 }) when N < N2 ->
+    {stop, bad_nonce, State};
+handle_hello(N, EC, Box, #{ vault := Vault, socket := Socket, side := server } = State) ->
 
-    STNonce = st_nonce(hello, client, 0),
+    STNonce = st_nonce(hello, client, N),
     {ok, <<0:512/integer>>} = Vault:box_open(Box, STNonce, EC),
 
     %% Once ES is in the hands of the client, the server doesn't need it anymore
@@ -573,7 +581,7 @@ handle_hello(EC, Box, #{ vault := Vault, socket := Socket, side := server } = St
     case  gen_tcp:send(Socket, e_cookie(EC, ES, ESs, Vault)) of
         ok ->
             ok = inet:setopts(Socket, [{active, once}]),
-            {next_state, awaiting_vouch, State};
+            {next_state, awaiting_vouch, State#{ rc := N }};
         {error, Reason} ->
             {stop, normal, {error, Reason}, State}
     end.
@@ -588,28 +596,29 @@ handle_tell(#{ socket := Socket, side := server, vault := Vault } = State) ->
             {stop, normal, {error, Reason}, State}
     end.
 
-handle_welcome(S, #{ socket := Socket, side := client } = State) ->
+handle_welcome(S, #{ socket := Socket, side := client, c := C } = State) ->
     #{ public := EC, secret := ECs } = enacl:box_keypair(),
-    case gen_tcp:send(Socket, e_hello(S, EC, ECs, 0)) of
+    case gen_tcp:send(Socket, e_hello(S, EC, ECs, C)) of
         ok ->
             ok = inet:setopts(Socket, [{active, once}]),
             {next_state, awaiting_cookie, State#{
                                             ephemeral_public_key => EC,
                                             ephemeral_secret_key => ECs,
-                                            c => 1,
-                                            rc => 0
+                                            c => C+1,
+                                            rc => -1
                                            }};
         {error, Reason} ->
             {stop, normal, reply({error, Reason}, State)}
     end.
 
 handle_tcp(Data, StateName, State) ->
+
     case {d_packet(Data), StateName} of
         {{msg, N, Box}, connected} -> handle_msg(N, Box, State);
         {{vouch, K, N, Box}, awaiting_vouch} -> handle_vouch(K, N, Box, State);
         {{cookie, N, Box}, awaiting_cookie} -> handle_cookie(N, Box, State);
         {{ready, N, Box}, awaiting_ready} -> handle_ready(N, Box, State);
-        {{hello, EC, 0, Box}, awaiting_hello} -> handle_hello(EC, Box, State);
+        {{hello, EC, N, Box}, awaiting_hello} -> handle_hello(N, EC, Box, State);
         {{welcome, S}, awaiting_welcome} -> handle_welcome(S, State);
         {tell, awaiting_hello} -> handle_tell(State)
     end.
@@ -803,4 +812,4 @@ encode_packet(4, Bin) when byte_size(Bin) < 16#FFFFFFFF ->
 millis_left(_BeforeTime, infinity) ->
     infinity;
 millis_left(BeforeTime, Timeout) ->
-    max(0, Timeout - (timer:now_diff(erlang:now(), BeforeTime) div 1000)).
+    max(0, Timeout - (timer:now_diff(os:timestamp(), BeforeTime) div 1000)).

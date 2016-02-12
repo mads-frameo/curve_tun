@@ -27,7 +27,7 @@ register(IP, PubKey) ->
 lookup(IP) ->
     gen_server:call(?SERVER, {lookup, IP}).
 
-verify(Socket, PubKey) ->
+verify(_Socket, _PubKey) ->
     %% TODO: check a blacklist maybe?
     true.
 
