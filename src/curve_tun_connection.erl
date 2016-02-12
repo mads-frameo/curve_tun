@@ -225,8 +225,13 @@ init([Controller,Socket,Options]) ->
                          State,
                          Options),
 
-    {ok, ready, State2}.
-
+    %% Vault setup
+    case State2 of
+        #{keypair:=KeyPair} ->
+            {ok, ready, State2#{vault:=vault_init(KeyPair)}};
+        _ ->
+            {ok, ready, State2}
+    end.
 
 %% @private
 ready({handshake, client, Timeout},
@@ -502,7 +507,7 @@ handle_vouch(K, N, Box, #{ c := C, socket := Sock, vault := Vault, registry := R
             {ok, <<ClientPK:32/binary, NonceLT:16/binary, Vouch:48/binary, MetaData/binary>>} = enacl:box_open(Box, Nonce, EC, ESs),
             true = Registry:verify(Sock, ClientPK),
             VNonce = lt_nonce(client, NonceLT),
-            {ok, <<EC:32/binary>>} = Vault:box_open(Vouch, VNonce, ClientPK),
+            {ok, <<EC:32/binary>>} = vault_box_open(Vault, Vouch, VNonce, ClientPK),
 
             case MetaData of
                 <<>> -> % client didn't send meta data
@@ -542,15 +547,19 @@ begin_connected(ClientPK, ESs, EC, MDIn, C, RC, State) ->
 handle_cookie(N, Box, #{ ephemeral_public_key := EC, ephemeral_secret_key := ECs, peer_public_key := S, socket := Socket, vault := Vault, metadata := MD, c := C } = State) ->
     Nonce = lt_nonce(server, N),
     {ok, <<ES:32/binary, K/binary>>} = enacl:box_open(Box, Nonce, S, ECs),
-    case gen_tcp:send(Socket, e_vouch(K, EC, S, Vault, C, ES, ECs, MD)) of
+    {ok, NonceBase, Vault2} = vault_safe_nonce(Vault),
+
+
+    case gen_tcp:send(Socket, e_vouch(K, EC, S, Vault2, C, ES, ECs, MD, NonceBase)) of
         ok ->
             ok = inet:setopts(Socket, [{active, once}]),
             {next_state, awaiting_ready, State#{
-			peer_ephemeral_public_key => ES,
-			recv_queue => queue:new(),
-			buf => undefined,
-			c => C+1,
-			side => client }};
+                                           vault => Vault2,
+                                           peer_ephemeral_public_key => ES,
+                                           recv_queue => queue:new(),
+                                           buf => undefined,
+                                           c => C+1,
+                                           side => client }};
         {error, _Reason} = Err ->
             {stop, normal, reply(Err, State)}
     end.
@@ -574,20 +583,21 @@ handle_hello(N, _, _, State = #{ rc := N2 }) when N < N2 ->
 handle_hello(N, EC, Box, #{ vault := Vault, socket := Socket, side := server } = State) ->
 
     STNonce = st_nonce(hello, client, N),
-    {ok, <<0:512/integer>>} = Vault:box_open(Box, STNonce, EC),
+    {ok, <<0:512/integer>>} = vault_box_open(Vault, Box, STNonce, EC),
 
     %% Once ES is in the hands of the client, the server doesn't need it anymore
     #{ public := ES, secret := ESs } = enacl:box_keypair(),
-    case  gen_tcp:send(Socket, e_cookie(EC, ES, ESs, Vault)) of
+    {ok, SafeNonce, Vault2} = vault_safe_nonce(Vault),
+    case  gen_tcp:send(Socket, e_cookie(EC, ES, ESs, Vault2, SafeNonce)) of
         ok ->
             ok = inet:setopts(Socket, [{active, once}]),
-            {next_state, awaiting_vouch, State#{ rc := N }};
+            {next_state, awaiting_vouch, State#{vault:=Vault2, rc := N }};
         {error, Reason} ->
             {stop, normal, {error, Reason}, State}
     end.
 
 handle_tell(#{ socket := Socket, side := server, vault := Vault } = State) ->
-    PK = Vault:public_key(),
+    PK = vault_public_key(Vault),
     case gen_tcp:send(Socket, e_welcome(PK)) of
         ok ->
             ok = inet:setopts(Socket, [{active, once}]),
@@ -658,24 +668,21 @@ e_hello(S, EC, ECs, N) ->
     Box = enacl:box(binary:copy(<<0>>, 64), Nonce, S, ECs),
     <<?HELLO_TAG, EC:32/binary, N:64/integer, Box/binary>>.
 
-e_cookie(EC, ES, ESs, Vault) ->
+e_cookie(EC, ES, ESs, Vault, SafeNonce) ->
     Ts = curve_tun_cookie:current_key(),
-    SafeNonce = Vault:safe_nonce(),
     CookieNonce = lt_nonce(minute_k, SafeNonce),
 
     KBox = enacl:secretbox(<<EC:32/binary, ESs:32/binary>>, CookieNonce, Ts),
     K = <<SafeNonce:16/binary, KBox/binary>>,
     BoxNonce = lt_nonce(server, SafeNonce),
-    Box = Vault:box(<<ES:32/binary, K/binary>>, BoxNonce, EC),
+    Box = vault_box(Vault, <<ES:32/binary, K/binary>>, BoxNonce, EC),
     <<?COOKIE_TAG, SafeNonce:16/binary, Box/binary>>.
 
-e_vouch(Kookie, VMsg, S, Vault, N, ES, ECs, MD) when byte_size(Kookie) == 96 ->
-    NonceBase = Vault:safe_nonce(),
-
+e_vouch(Kookie, VMsg, S, Vault, N, ES, ECs, MD, NonceBase) when byte_size(Kookie) == 96 ->
     %% Produce the box for the vouch
     VouchNonce = lt_nonce(client, NonceBase),
-    VouchBox = Vault:box(VMsg, VouchNonce, S),
-    C = Vault:public_key(),
+    VouchBox = vault_box(Vault, VMsg, VouchNonce, S),
+    C = vault_public_key(Vault),
     
     STNonce = st_nonce(initiate, client, N),
     MetaData = e_metadata(MD),
@@ -753,7 +760,7 @@ is_tcp_option(Opt) ->
 is_curve_option(Opt) ->
     case Opt of
         {K,_} ->
-            lists:member(K, [active, metadata, packet, peer_public_key, key, vault]);
+            lists:member(K, [active, metadata, packet, peer_public_key, keypair, vault]);
         _ ->
             false
     end.
@@ -813,3 +820,31 @@ millis_left(_BeforeTime, infinity) ->
     infinity;
 millis_left(BeforeTime, Timeout) ->
     max(0, Timeout - (timer:now_diff(os:timestamp(), BeforeTime) div 1000)).
+
+
+%%% Vault %%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+vault_init(#{ public := Public, secret := Secret }) ->
+    {internal_vault, #{public_key => Public, secret_key => Secret, counter => 0, nonce_key => enacl:randombytes(32) }}.
+
+vault_public_key({internal_vault, #{public_key:=PK}}) ->
+    PK;
+vault_public_key(Vault) ->
+    Vault:public_key().
+
+vault_box_open({internal_vault, #{secret_key:=SK}}, Box, Nonce, SignatureKey) ->
+    enacl:box_open(Box, Nonce, SignatureKey, SK);
+vault_box_open(Vault, Vouch, VNonce, ClientPK) ->
+    Vault:box_open(Vouch, VNonce, ClientPK).
+
+vault_box({internal_vault, #{secret_key:=SK}}, Msg, Nonce, PublicKey) ->
+    enacl:box(Msg, Nonce, PublicKey, SK);
+vault_box(Vault, VMsg, VouchNonce, S) ->
+    Vault:box(VMsg, VouchNonce, S).
+
+vault_safe_nonce({internal_vault, VaultState=#{nonce_key := NK, counter := C }}) ->
+    RandomBytes = enacl:randombytes(8),
+    SafeNonce = enacl_ext:scramble_block_16(<<C:64/integer, RandomBytes/binary>>, NK),
+    {ok, SafeNonce, {internal_vault, VaultState#{counter := C+1 }}};
+vault_safe_nonce(Vault) ->
+    {ok, Vault:safe_nonce(), Vault}.
