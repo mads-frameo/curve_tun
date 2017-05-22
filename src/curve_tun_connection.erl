@@ -614,6 +614,7 @@ handle_welcome(S, #{ socket := Socket, side := client, c := C } = State) ->
             {next_state, awaiting_cookie, State#{
                                             ephemeral_public_key => EC,
                                             ephemeral_secret_key => ECs,
+                                            peer_public_key => S,
                                             c => C+1,
                                             rc => -1
                                            }};
