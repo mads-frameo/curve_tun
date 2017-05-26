@@ -4,7 +4,8 @@
 -export([connect/3, connect/4, transport_accept/2, handshake/3, handshake/4, accept/1, accept/2, listen/2, send/2, close/1,
          recv/1, recv/2, controlling_process/2,
          metadata/1,
-         peername/1, setopts/2, peer_public_key/1
+         peername/1, setopts/2, peer_public_key/1,
+         shared_secret_beware/1
         ]).
 
 %% Private callbacks
@@ -186,6 +187,10 @@ controlling_process(#curve_tun_socket { pid = Pid }, Controller) ->
 metadata(#curve_tun_socket{ pid=Pid}) ->
     sync_send_event(Pid, metadata).
 
+%%% Access the ephemeral secret key. THINK BEFORE USING - DO NOT LEAK.
+shared_secret_beware(#curve_tun_socket { pid = Pid }) ->
+    sync_send_all_state_event(Pid, shared_secret_beware).
+
 %% @private
 start_fsm(Socket, Options) ->
     Controller = self(),
@@ -350,6 +355,15 @@ handle_sync_event(peer_public_key, From, Statename, #{ peer_public_key := Key }=
     {next_state, Statename, State};
 handle_sync_event(peer_public_key, From, Statename, State) ->
     gen_fsm:reply(From, undefined),
+    {next_state, Statename, State};
+handle_sync_event(shared_secret_beware, From, Statename, State) ->
+    case State of
+        #{ peer_ephemeral_public_key:=PK, ephemeral_secret_key:=SK } ->
+            K = enacl:box_beforenm(PK, SK),
+            Res={ok,K};
+        _ -> Res = undefined
+    end,
+    gen_fsm:reply(From, Res),
     {next_state, Statename, State};
 handle_sync_event(Event, _From, Statename, State) ->
     error_logger:info_msg("Unknown sync_event ~p in state ~p", [Event, Statename]),
