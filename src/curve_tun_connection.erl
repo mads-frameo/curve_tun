@@ -11,7 +11,7 @@
 -export([start_fsm/2, start_link/3]).
 
 %% FSM callbacks
--export([init/1, code_change/4, terminate/3, handle_info/3, handle_event/3, handle_sync_event/4]).
+-export([init/1, code_change/4, terminate/3, handle_info/3, handle_event/3, handle_sync_event/4, format_status/2]).
 
 -export([
 	connected/2, connected/3,
@@ -359,7 +359,7 @@ handle_event(Event, Statename, State) ->
     error_logger:info_msg("Unknown event ~p in state ~p", [Event, Statename]),
     {next_state, Statename, State}.
 
-handle_info({'DOWN', _Ref, process, Pid, _Info}, _Statename, #{ controller := Pid, socket := Socket } = State) ->
+handle_info({'DOWN', _Ref, process, Pid, _Info}, _Statename, #{ controller := {Pid,_Ref2}, socket := Socket } = State) ->
     ok = gen_tcp:close(Socket),
     {stop, normal, maps:remove(socket, State)};
 handle_info({tcp, Sock, Data}, Statename, #{ socket := Sock } = State) ->
@@ -378,8 +378,30 @@ handle_info({timer, {sync_recv, From}}, Statename, #{ recv_queue := Q } = State)
                                        queue:to_list(Q))),
     {next_state, Statename, State#{ recv_queue => NewQ }};
 handle_info(Info, Statename, State) ->
-    error_logger:info_msg("Unknown info msg ~p in state ~p with state: ~p", [Info, Statename, State]),
+    error_logger:info_msg("Unknown info msg ~p in state ~p with state: ~p", [Info, Statename, censor_state(State)]),
     {next_state, Statename, State}.
+
+format_status(Opt, [_PDict, State0]) ->
+    State = censor_state(State0),
+    %% Default formatting, as taken from gen_server:format_status/4:
+    case Opt of
+        terminate -> State;
+        _ -> [{data, [{"State", State}]}]
+    end.
+
+censor_state(State) ->
+    censor_field(ephemeral_secret_key,
+                 censor_field(ephemeral_public_key,
+                              censor_field(peer_ephemeral_public_key,
+                                           State))).
+
+censor_field(Key, Map) when is_map(Map) ->
+    case maps:is_key(Key, Map) of
+        true ->
+            maps:put(Key, '<censored>', Map);
+        false ->
+            Map
+    end.
 
 
 terminate(_Reason, _Statename, State) ->
