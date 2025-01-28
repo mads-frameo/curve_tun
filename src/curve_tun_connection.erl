@@ -44,6 +44,9 @@
 %% tries to mimick the behavior of public methods for ssl
 %%
 
+binary_to_hex(Binary) when is_binary(Binary) ->
+    lists:flatten(lists:map(fun(Byte) -> io_lib:format("~2.16.0B", [Byte]) end, binary:bin_to_list(Binary))).
+
 connect(Port, Options, Timeout)
   when is_port(Port),
        is_list(Options),
@@ -540,6 +543,10 @@ handle_vouch(K, N, Box, #{ c := C, socket := Sock, vault := Vault, registry := R
     case unpack_cookie(K) of
         {ok, EC, ESs} ->
             Nonce = st_nonce(initiate, client, N),
+            io:format("EC: ~s", [binary_to_hex(EC)]),
+            io:format("ESs: ~s", [binary_to_hex(ESs)]),
+            io:format("Nonce: ~s", [binary_to_hex(Nonce)]),
+            io:format("Box: ~s", [binary_to_hex(Box)]),
             {ok, <<ClientPK:32/binary, NonceLT:16/binary, Vouch:48/binary, MetaData/binary>>} = enacl:box_open(Box, Nonce, EC, ESs),
             true = Registry:verify(Sock, ClientPK),
             VNonce = lt_nonce(client, NonceLT),
